@@ -1,0 +1,22 @@
+# Versions épinglées (CDC) : une montée de version ne peut pas casser l'app.
+# streamlit >= 1.41 requis : sélection de lignes dans st.dataframe et boîtes
+# de dialogue larges.
+streamlit==1.49.1
+# >= 0.89.0 : API Lakebase Autoscaling et rotation OAuth stabilisées.
+databricks-sdk==0.89.0
+# Client Postgres (Lakebase) — wheel binaire, pas de compilation au déploiement.
+psycopg[binary]==3.2.3
+psycopg-pool==3.2.3
+pandas==2.2.3
+numpy==1.26.4
+# Importé directement (heatmaps du tableau de bord). Streamlit 1.49.1 EXCLUT
+# explicitement 5.4.0 et 5.4.1 (altair!=5.4.0,!=5.4.1) : les épingler rend le
+# déploiement impossible (ResolutionImpossible).
+altair==5.5.0
+# Export PDF des BL et rendu des rapports d'activité.
+fpdf2==2.8.7
+# Rasterisation du PDF des scans. Wheel binaire autonome, aucun binaire
+# système à installer (pas de poppler).
+pymupdf==1.24.14
+# Traitement des images incorporées aux PDF et aux pages.
+pillow==10.4.0
