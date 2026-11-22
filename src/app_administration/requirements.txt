@@ -9,6 +9,11 @@ psycopg[binary]==3.2.3
 psycopg-pool==3.2.3
 pandas==2.2.3
 numpy==1.26.4
+# Tiré par Streamlit (st.dataframe) mais À ÉPINGLER : pyarrow récent exige
+# NumPy >= 2 à l'exécution SANS le déclarer, si bien que pip installe la
+# dernière version sans conflit apparent — et l'app plante au premier
+# tableau (« pyarrow requires NumPy 2.0 or newer »). 17.0.0 accepte NumPy 1.26.
+pyarrow==17.0.0
 # Importé directement (heatmaps du tableau de bord). Streamlit 1.49.1 EXCLUT
 # explicitement 5.4.0 et 5.4.1 (altair!=5.4.0,!=5.4.1) : les épingler rend le
 # déploiement impossible (ResolutionImpossible).
