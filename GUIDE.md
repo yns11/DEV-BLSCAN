@@ -99,14 +99,21 @@ quatre jobs.
 ## Étape 2 — Créer le schéma et les tables
 
 Ouvrir l'**éditeur SQL du projet Lakebase** (⚠️ pas l'éditeur SQL Spark) sur la
-branche `production`, puis exécuter **un seul fichier** :
+branche `production`, puis exécuter **dans l'ordre** :
 
 ```
 sql/migrations/V001__baseline_scan.sql
+sql/migrations/V002__scans_multi_bl.sql
 ```
 
-C'est une baseline consolidée (les `V002` à `V004` de la solution d'origine y
-sont intégrées). Elle est **idempotente** : ré-exécutable sans risque.
+`V001` est la baseline consolidée du schéma. `V002` ajoute à la file de scans
+ce qu'il faut pour les **lots de plusieurs bordereaux** (§3.6). Les deux sont
+**idempotentes** : ré-exécutables sans risque.
+
+> **Installation déjà en service :** exécuter seulement `V002`, **avant** de
+> déployer le nouveau code. Sans elle, le job `traitement_scans` s'arrête au
+> démarrage avec un message qui la réclame, et les vues de scans de
+> l'application affichent une erreur de lecture.
 
 Elle crée le schéma `bl_scan` et, en plus des tables métier habituelles :
 
@@ -303,7 +310,7 @@ laisse une très large marge : un scan est traité en **15 minutes au pire**
 | `expediteurs_autorises` | *(vide = pas de filtre)* ; CSV, ex. `copieur-hall@emotors.com` |
 | `max_messages` | `50` par relève |
 | `max_octets_pdf` | `41943040` (40 Mo) |
-| `max_pages` | `25` |
+| `max_pages` | `60` — pages par **scan** (un scan peut contenir plusieurs BL) |
 
 ### Paramètres de `traitement_scans`
 
@@ -315,6 +322,10 @@ laisse une très large marge : un scan est traité en **15 minutes au pire**
 | `auto_sans_desadv` | `false` — voir §4 |
 | `max_scans` | `40` scans par exécution |
 | `dpi` | `150` (72–400) |
+| `multi_bl` | `true` — découpe les scans de plusieurs bordereaux ; `false` = un scan est toujours un seul BL |
+| `multi_bl_auto` | `true` — un lot sans aucun doute est découpé sans intervention ; `false` = tout lot est confirmé par un gestionnaire |
+| `max_pages_bl` | `25` — au-delà, un groupe est jugé anormalement long dans un lot |
+| `max_pages_lot` | `60` — même valeur que `max_pages` de l'ingestion |
 
 ### Paramètres de `maintenance`
 
@@ -568,23 +579,26 @@ PDF mal formé.
 ```
 prendre_scans_a_analyser()   ← FOR UPDATE SKIP LOCKED, statut RECU → EN_ANALYSE
    │
-   ├─ 1. rasterisation du PDF (1 à 25 pages), 150 dpi
-   ├─ 2. extraction IA sur TOUTES les pages ensemble
+   ├─ 0. un bordereau ou plusieurs ? lecture page par page + découpage (§3.6)
+   │       ├─ plusieurs, sans doute → scans fils, analysés dans la foulée
+   │       └─ plusieurs, avec doute → statut A_DECOUPER (confirmation humaine)
+   ├─ 1. rasterisation du PDF, 150 dpi
+   ├─ 2. extraction IA sur TOUTES les pages du bordereau ensemble
    ├─ 3. decision.decider(…)
    │       ├─ automatique → BL créé en UNE transaction + notification Teams
    │       └─ à valider   → statut A_VALIDER + motif + extraction conservée
    └─ 4. cloturer_scan(…)
 ```
 
-Un scan est **un** bordereau : toutes ses pages sont envoyées au modèle dans le
-même appel, exactement comme un BL photographié en plusieurs prises dans la
-solution d'origine. C'est `extraction.extraire_infos_bl`, **la même fonction**,
+Une fois isolé, un bordereau est lu d'un bloc : toutes ses pages — annexes
+exclues — sont envoyées au modèle dans le même appel, exactement comme un BL
+photographié en plusieurs prises dans la solution d'origine. C'est `extraction.extraire_infos_bl`, **la même fonction**,
 avec ses passes de raffinement (réinterrogation avec la liste des tiers si le
 tiers n'est pas reconnu, puis avec les BL du tiers reconnu).
 
 **Isolement des erreurs.** Chaque scan est traité indépendamment : une
 exception le fait passer en `ERREUR` (visible et rejouable) sans toucher aux
-autres. La tâche n'échoue que si **tous** les scans du lot ont échoué — signe
+autres. La tâche n'échoue que si **tous** les scans de l'exécution ont échoué — signe
 d'un problème systémique (endpoint indisponible, droits) plutôt que d'un scan
 mal formé isolé.
 
@@ -661,6 +675,11 @@ RECU ──▶ EN_ANALYSE ──┬──▶ TRAITE_AUTO  (BL créé, id_bl rens
   ▲                   │
   │                   ├──▶ A_VALIDER ──┬──▶ VALIDE  (BL créé après contrôle)
   │                   │                └──▶ REJETE  (motif obligatoire)
+  │                   │
+  │                   ├──▶ DECOUPE      (lot : réparti en scans fils, qui
+  │                   │                  repartent chacun de RECU)
+  │                   ├──▶ A_DECOUPER ──▶ DECOUPE (après confirmation) ou REJETE
+  │                   │
   └───────────────────┴──▶ ERREUR  (rejouable)
      (maintenance relance
       les analyses interrompues)
@@ -669,6 +688,61 @@ RECU ──▶ EN_ANALYSE ──┬──▶ TRAITE_AUTO  (BL créé, id_bl rens
 Le PDF source est conservé `BL_SCAN_RETENTION_PDF_JOURS` jours (180 par défaut)
 puis purgé par la maintenance. La **ligne** de `scans_recus` reste, ainsi que
 les images du BL : la traçabilité est intacte, seul l'octet lourd disparaît.
+
+## 3.6 Scans de plusieurs bordereaux (lots)
+
+Le réceptionniste peut passer une **pile entière** au copieur : 3 pages pour un
+BL, 2 pages et une lettre de voiture pour le suivant, 5 pages pour un
+troisième. Le scan est alors un **lot**, découpé en groupes de pages — un par
+bordereau. Chaque groupe devient un scan fils qui suit le circuit ci-dessus,
+sans aucune différence.
+
+**Lecture page par page.** Chaque page est envoyée **seule** au modèle, qui en
+dresse la fiche : type de document, numéro de BL imprimé, pagination (« 2/3 »),
+première page ou page de suite. Le modèle ne voit jamais deux bordereaux à la
+fois. Les versos vides sont repérés sans appel au modèle.
+
+**Découpage par règles** (`bl_core/segmentation.py`, sans IA, sans base, sans
+réseau — testable cas par cas, comme la règle de décision) :
+
+| Ce que la page montre | Ce qui est décidé |
+|---|---|
+| Un numéro de BL différent du précédent | Nouveau bordereau |
+| Le même numéro, ou une pagination qui continue | Suite du même bordereau |
+| Lettre de voiture, liste de colisage, certificat… | **Annexe du BL qui la précède** ; ne crée jamais de bordereau, et n'est pas lue avec les pages du BL (son numéro n'est pas un numéro de BL) |
+| Page blanche | Écartée, sans créer de coupe |
+| Aucun numéro, page de suite | Rattachée au bordereau en cours |
+
+**Ce qui déclenche une confirmation humaine** (statut `A_DECOUPER`) :
+
+| Doute | Pourquoi |
+|---|---|
+| Début de document sans numéro lisible | Nouveau BL, ou suite du précédent ? Un BL illisible avalé par son voisin serait perdu sans trace. |
+| Numéros presque identiques, sans pagination | Deux BL consécutifs (…398, …399) ou une erreur de lecture ? |
+| Le même numéro dans deux groupes | Pile mélangée, ou exemplaire en double |
+| Page que le modèle n'a pas pu analyser | Rien ne permet de la ranger |
+| Groupe sans numéro, ou anormalement long | Une coupe a probablement été manquée |
+
+Le principe est le même que pour la création automatique, transposé au
+découpage : **une page rangée dans le mauvais BL ne se voit pas**. Une erreur de
+lecture se remarque — le numéro ne correspond à rien ; une erreur de découpage
+produit deux bordereaux plausibles et faux. Tout doute passe donc devant un
+gestionnaire.
+
+**Sans doute**, le lot est découpé sans intervention et ses bordereaux sont
+analysés **dans la même exécution** du job : ceux que l'ERP confirme sont créés
+aussitôt, les autres partent en validation, chacun pour son compte. Le
+paramètre `multi_bl_auto=false` impose une confirmation humaine pour tout lot,
+utile le temps de mesurer la fiabilité du découpage sur vos bordereaux.
+
+**Traçabilité.** Le lot garde la fiche de chaque page et les coupes retenues
+(colonne `decoupage`) ; chaque scan fils connaît son lot et ses pages
+(`id_parent`, `page_debut`, `page_fin`). La clé d'un fils dérive de celle du
+lot et de ses pages : un job relancé ne recrée rien.
+
+**Un scan d'un seul bordereau** donne un seul groupe et se comporte comme
+avant. Seule différence : ses annexes éventuelles ne sont plus lues comme des
+pages du BL.
 
 ---
 
@@ -687,9 +761,11 @@ rôle :
 Sur ces deux vues, le fil d'Ariane cède la place à un titre compact : la hauteur
 d'écran gagnée va à l'image, qui occupe **70 %** de la largeur utile.
 
-**File d'attente.** Une grille des scans `A_VALIDER` : fichier, expéditeur,
-nombre de pages, date de réception, confiance, motif. Le bouton **« Prendre en
-charge »** pose un **verrou** (`BL_SCAN_VERROU_MINUTES`, 60 min) : deux
+**File d'attente.** Une grille de ce qui attend un gestionnaire : les
+bordereaux `A_VALIDER` et les lots `A_DECOUPER`. La colonne « À faire »
+distingue « BL à valider », « BL d'un lot (p. 4-6) » et « Lot à découper ». Le
+bouton **« Prendre en charge »** (ou **« Découper le lot »**) pose un
+**verrou** (`BL_SCAN_VERROU_MINUTES`, 60 min) : deux
 gestionnaires ne travaillent jamais sur le même scan. Quitter la vue libère le
 verrou ; un verrou oublié est libéré par la maintenance après
 `scan_verrou_heures`.
@@ -705,13 +781,41 @@ Quatre actions :
 
 | Action | Effet |
 |---|---|
-| **✅ Valider et créer le BL** | BL créé avec l'origine `SCAN_VALIDE` + notification |
+| **✅ Créer le BL** | BL créé avec l'origine `SCAN_VALIDE` + notification |
 | **🔄 Relancer l'analyse IA** | rappelle le modèle (utile après une mise à jour du référentiel) |
-| **🚫 Écarter ce scan** | statut `REJETE`, **motif obligatoire** |
-| **↩️ Libérer** | rend le scan à la file sans décision |
+| **🗑️ Écarter** | statut `REJETE`, **motif obligatoire** |
+| **↩️ Rendre à la file** | libère le scan sans décision |
+| **✂️ Revoir le découpage du lot** | pour un bordereau issu d'un lot : rouvre le lot entier (voir ci-dessous) |
 
 Le numéro saisi est contrôlé **en direct** contre la base : un doublon est
 signalé avant l'enregistrement, pas après.
+
+**Écran de découpage d'un lot.** Il s'ouvre sur la proposition du pipeline —
+aucun appel au modèle. Chaque page est une vignette, avec ce qui y a été lu
+(« BL 8402002398 · 2/3 », « Lettre de voiture ») et une pastille de couleur
+par bordereau. Deux cases par page :
+
+- **« Nouveau BL ici »** : la page ouvre un bordereau. La décocher la réunit
+  au bordereau précédent ;
+- **« Écarter la page »** : elle n'entrera dans aucun BL (page blanche,
+  document étranger).
+
+Le tableau « bordereaux obtenus » se recalcule à chaque geste. Les incohérences
+sont signalées — un numéro présent dans deux groupes, deux numéros dans le même
+groupe, un groupe réduit à des annexes — et doivent être **assumées par une
+case à cocher** avant de confirmer : le modèle a pu mal lire, le gestionnaire
+reste juge. « Revenir à la proposition » annule les modifications ; un
+panneau repliable affiche les pages en grand, avec zoom et rotation.
+
+À la confirmation, chaque groupe devient un scan à part, analysé au passage
+suivant du pipeline (10 minutes environ) : création automatique si l'ERP le
+confirme, validation sinon.
+
+**Revoir un découpage.** Depuis un bordereau issu d'un lot, « Revoir le
+découpage du lot » supprime les groupes et rouvre le lot. C'est possible
+**tant qu'aucun BL n'a été créé à partir du lot** ; ensuite, le découpage est
+figé (déplacer une page d'un BL déjà créé vers un autre n'est pas proposé :
+corriger alors les BL concernés depuis leur fiche).
 
 ## 4.2 Pipeline ▸ Scans reçus
 
@@ -824,6 +928,11 @@ journalisés en base, simplement pas publiés dans Teams.
 | Un scan reste en `RECU` | Le job `traitement_scans` ne tourne pas, ou son *Run as* n'a pas les droits. Voir son log. |
 | Un scan est en `ERREUR` | Le log de `traitement_scans` porte l'exception. Causes fréquentes : endpoint de modèle indisponible, PDF corrompu, GRANT manquant. Corriger puis remettre le statut à `RECU` (`UPDATE bl_scan.scans_recus SET statut='RECU' WHERE id=…`). |
 | Un scan reste en `EN_ANALYSE` | Job tué en cours de route. La **maintenance** le repasse en `RECU` automatiquement. |
+| Job : « exécutez sql/migrations/V002__scans_multi_bl.sql » | La migration des lots n'a pas été jouée sur cette base. L'exécuter dans l'éditeur SQL Lakebase (idempotente), puis relancer. |
+| Un lot est mal découpé | S'il est encore `A_DECOUPER` : déplacer les coupes dans l'écran de découpage. S'il a été découpé automatiquement : ouvrir un de ses bordereaux à valider ▸ « Revoir le découpage du lot », possible tant qu'aucun BL n'en est sorti. |
+| Trop de lots partent en confirmation | Lire le motif. « Début de document sans numéro lisible » revient souvent : tampon ou agrafe sur le numéro. « Page non analysée » : endpoint de modèle saturé. |
+| Un BL contient une page d'un autre | Découpage automatique fautif. Passer `multi_bl_auto` à `false` le temps de comprendre, et conserver le scan en exemple : c'est le cas à ajouter aux tests de `segmentation.py`. |
+| Une page écrite a disparu d'un BL | Elle a été prise pour une page blanche. Ne devrait pas arriver (une ligne manuscrite suffit à la garder) ; le PDF du lot la contient toujours pendant la durée de conservation. |
 | Trop de scans partent en validation | Regarder la colonne « Motif » de la file. Le plus souvent : **DESADV absent** (le job `sync_referentiels_erp` tourne-t-il ?), ou tiers absent du référentiel. Le taux d'automatisation de la vue Scans reçus mesure le progrès. |
 | Un BL a été créé avec le mauvais tiers | La ligne `scans_recus` conserve l'extraction complète (`extraction` JSONB) et l'écart éventuel avec le DESADV : de quoi comprendre. Corriger le BL dans sa fiche ; l'audit garde la trace. |
 | Le mauvais sens (achat/vente) | Le sens vient de l'alias visé, cherché dans le destinataire, le sujet **et** les en-têtes de routage (Exchange masquant l'alias dans le destinataire, cf. GUIDE_MICROSOFT365 §2). Vérifier le bouton du copieur puis `alias_achat`/`alias_vente`. Un mail sans alias reconnu est **rejeté**, jamais rangé au hasard. |
@@ -884,7 +993,8 @@ shared/bl_core/          code partagé (source de vérité)
   repository.py          accès aux données métier ET à la file de scans
   graph_mail.py          client Microsoft Graph (urllib seul, aucune dépendance)
   decision.py            règle de décision : création automatique ou validation
-  scan_pdf.py            PDF -> images + préchargeur IA de la file de validation
+  segmentation.py        découpage d'un scan de plusieurs BL (règles, sans IA)
+  scan_pdf.py            PDF -> images, extraction de pages, page blanche
   extraction.py          extraction IA d'un BL (toutes ses pages ensemble)
   llm.py                 appel mutualisé à l'endpoint de model serving
   teams.py               cartes Teams (adaptative + MessageCard)
@@ -894,7 +1004,7 @@ shared/bl_core/          code partagé (source de vérité)
   cache.py               mémoïsation (Streamlit dans l'app, lru_cache en job)
   pdf_bl.py, ui.py, validation.py, identity.py
 src/app_administration/  app + copie de bl_core + app.yaml + requirements.txt
-sql/migrations/          V001__baseline_scan.sql (baseline consolidée)
+sql/migrations/          V001 (baseline consolidée), V002 (lots multi-BL)
 sql/simulation/          suppression du jeu de données de simulation
 jobs/                    ingestion, traitement, sync ERP, rapports,
                          maintenance, simulation + README

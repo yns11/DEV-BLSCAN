@@ -130,8 +130,8 @@ def schema():
                        x2 - p * math.cos(a + 0.45), y2 - p * math.sin(a + 0.45)],
                       fillColor=couleur, strokeColor=None))
 
-    boite(xs[0], ym, ["Scan au copieur", "un bordereau,", "toutes ses pages"], MARINE)
-    boite(xs[1], ym, ["Lecture", "et rapprochement", "avec l'ERP"], MARINE)
+    boite(xs[0], ym, ["Scan au copieur", "un bordereau", "ou une pile"], MARINE)
+    boite(xs[1], ym, ["Découpage, lecture", "et rapprochement", "avec l'ERP"], MARINE)
     boite(xs[2], yh, ["BL créé seul", "+ notification Teams"], SARCELLE)
     boite(xs[2], yb, ["À valider", "champs déjà remplis"], AMBRE)
     boite(xs[3], ym, ["BL consultable", "recherche, PDF,", "historique"], MARINE)
@@ -146,6 +146,11 @@ def schema():
     d.add(String(xs[2] + bw / 2, yb + bh + 2.2 * mm, "doute", fontName="Sans",
                  fontSize=7, fillColor=AMBRE, textAnchor="middle"))
     return d
+
+
+def libre(elements):
+    """Bloc autorisé à se répartir sur deux pages (évite une page à moitié vide)."""
+    return elements
 
 
 def decor(canvas, doc):
@@ -192,12 +197,15 @@ histoire = [
         "Choisir le bouton <b>« BL Réception »</b> pour une réception, "
         "<b>« BL Expédition »</b> pour une expédition. Le bouton détermine le sens "
         "du flux : ne pas les confondre.",
-        "<b>Un scan = un bordereau</b>, avec toutes ses pages (jusqu'à 25). Ne pas "
-        "regrouper plusieurs BL dans un même scan.",
+        "<b>Une pile de plusieurs bordereaux peut passer en une fois</b> "
+        "(60 pages au plus) : l'application repère où commence chaque BL. Garder "
+        "les pages dans l'ordre, et chaque lettre de voiture <b>juste après</b> "
+        "son bordereau — elle lui sera rattachée.",
+        "Ne pas mélanger réceptions et expéditions dans une même pile.",
         "Le BL apparaît dans l'application en <b>15 minutes environ</b>, 30 au plus.",
     ]),
 
-    KeepTogether([
+    *libre([
         *titre("Valider un scan",
                "Achat ▸ Scans à valider (achat) · Vente ▸ Scans à valider (vente)"),
         etapes([
@@ -221,6 +229,29 @@ histoire = [
             ("Rendre à la file", "Libérer le scan sans décision, pour qu'un "
                                  "collègue le reprenne."),
         ], largeur_1=44 * mm),
+    ]),
+
+    KeepTogether([
+        *titre("Découper un lot",
+               "Scans à valider ▸ ligne « Lot à découper » ▸ Découper le lot"),
+        Paragraph(
+            "Quand une pile est claire, elle est découpée seule. Quand "
+            "l'application hésite sur une coupe (numéro masqué par un tampon, "
+            "pile en désordre), le lot vous est présenté, avec la raison du "
+            "doute et une vignette par page.", S["corps"]),
+        Spacer(1, 2 * mm),
+        tableau([
+            ("Nouveau BL ici", "À cocher sur la première page de chaque bordereau. "
+                               "Décocher réunit la page au BL précédent."),
+            ("Écarter la page", "Page blanche ou document étranger : elle "
+                                "n'entrera dans aucun BL."),
+            ("Confirmer le découpage", "Chaque bordereau part ensuite dans le "
+                                       "circuit habituel (10 minutes environ). "
+                                       "Une alerte doit être cochée pour être "
+                                       "passée outre."),
+            ("Revoir le découpage du lot", "Depuis un bordereau issu d'un lot, "
+                                           "tant qu'aucun BL n'en a été créé."),
+        ], largeur_1=50 * mm),
     ]),
 
     KeepTogether([

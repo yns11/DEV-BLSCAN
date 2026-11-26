@@ -43,9 +43,15 @@ env:
     value: "databricks-claude-opus-4-8"
 
   # --- Pipeline de scan -------------------------------------------------------
-  # Un scan = UN bordereau, de 1 à 25 pages (5 en moyenne).
+  # Un BORDEREAU fait 1 à 25 pages (5 en moyenne). Dans un lot, un groupe plus
+  # long est signalé comme suspect (coupe manquée ?).
   - name: BL_SCAN_MAX_PAGES
     value: "25"
+  # Un SCAN peut contenir plusieurs bordereaux passés ensemble au copieur :
+  # plafond de pages du PDF (dépôt manuel et affichage). Garder la même valeur
+  # que le paramètre « max_pages » du job d'ingestion.
+  - name: BL_SCAN_MAX_PAGES_LOT
+    value: "60"
   # Scans pré-analysés en avance dans l'écran de validation.
   - name: BL_SCAN_PAGES_AVANCE
     value: "1"

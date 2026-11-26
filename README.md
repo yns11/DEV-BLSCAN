@@ -5,7 +5,8 @@ scans du copieur professionnel**, sans photo ni saisie au quai.
 
 Le réceptionniste scanne le BL sur le multifonction, qui l'envoie par mail à un
 alias dédié (un par sens de flux). Un job relève la boîte via Microsoft Graph,
-un second analyse le scan avec un modèle vision, le rapproche du référentiel et
+un second découpe le scan s'il contient **plusieurs bordereaux**, analyse
+chacun avec un modèle vision, le rapproche du référentiel et
 **crée le BL automatiquement** quand le recoupement est sûr. Sinon, le scan part
 en **validation contrôlée** dans l'app Administration, champs déjà pré-remplis.
 
@@ -43,7 +44,10 @@ Copieur ──mail──▶ Boîte M365 ──Graph──▶ ingestion_scans ─
   décide), plus la synchronisation ERP, les rapports, la maintenance et le
   générateur de données de simulation (`jobs/README.md`).
 - `sql/migrations` : `V001__baseline_scan.sql`, baseline consolidée du schéma
-  `bl_scan` ; `sql/simulation` : purge du jeu de test.
+  `bl_scan`, puis `V002__scans_multi_bl.sql` (lots de plusieurs bordereaux) ;
+  `sql/simulation` : purge du jeu de test.
+- `tests` : 130 tests, dont un de bout en bout sur une vraie base PostgreSQL
+  (`tests/README.md`) ; `docs` : guide rapide utilisateur (PDF).
 
 Il n'y a **plus d'app Création de BL** : c'est le pipeline qui crée les BL, et
 les vues BL ne contiennent que des bordereaux **déjà traités** — créés
@@ -56,6 +60,10 @@ automatiquement ou validés par un gestionnaire.
   recoupement avec un **système tiers** (l'avis d'expédition de l'ERP). Le
   rapprochement par code tiers seul est possible mais **désactivé par défaut**
   (`BL_SCAN_AUTO_SANS_DESADV`).
+- **Une page rangée dans le mauvais BL ne se voit pas.** Un scan peut
+  contenir plusieurs bordereaux ; il est découpé page par page, par des règles
+  (`segmentation.py`), jamais par une lecture groupée. Une annexe suit le BL
+  qui la précède. Tout doute sur une coupe passe devant un gestionnaire.
 - **`decision.py` ne fait aucun accès base ni appel réseau** : ses dépendances
   sont injectées. La règle métier la plus sensible de la solution est donc
   testable de bout en bout, et testée.

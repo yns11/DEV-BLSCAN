@@ -1881,14 +1881,18 @@ def vue_validation_scans(sens: str) -> None:
             "champs sont pré-remplis par l'IA : corrigez ce qui doit l'être, "
             "puis créez le BL. Les scans rapprochés avec un avis d'expédition "
             f"sont déjà devenus des BL, visibles dans « BL "
-            f"{'expédition' if est_vente else 'réception'} ».")
+            f"{'expédition' if est_vente else 'réception'} ». Un scan de "
+            "plusieurs bordereaux dont le découpage est douteux apparaît ici "
+            "comme « Lot à découper ».")
         if st.button("🔄 Actualiser", key=f"maj_scans_{sens}"):
             st.rerun()
         if df is None or df.empty:
             st.success("✅ Aucun scan en attente de validation.")
             return
         st.metric("Scans à valider", len(df))
-        df = df.assign(nature=[_nature_scan(ligne) for _, ligne in df.iterrows()])
+        df = df.assign(
+            nature=[_nature_scan(ligne) for _, ligne in df.iterrows()],
+            confiance=df["confiance"].fillna("").astype(str))
         selection = st.dataframe(
             df[["recu_le", "nature", "nom_fichier", "nb_pages", "confiance",
                 "motif_validation", "verrouille_par"]],
@@ -2181,7 +2185,8 @@ def ecran_decoupage(detail: dict, pages: list[bytes]) -> None:
         colonnes = st.columns(_PAGES_PAR_LIGNE)
         for position, index in enumerate(
                 range(debut_ligne, min(debut_ligne + _PAGES_PAR_LIGNE, len(pages)))):
-            with colonnes[position]:
+            # Cadre : une page blanche sur fond blanc ne se distinguerait pas.
+            with colonnes[position], st.container(border=True):
                 rang = groupe_de.get(index)
                 appartenance = ("⬜ écartée" if rang is None else
                                 f"{_PASTILLES[rang % len(_PASTILLES)]} BL {rang + 1}")

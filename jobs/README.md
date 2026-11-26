@@ -11,7 +11,7 @@ sans changement de la solution d'origine.
 | Script | Rôle | Planification conseillée |
 |---|---|---|
 | `ingestion_scans.py` | Relève la boîte de scan via **Microsoft Graph**, contrôle chaque pièce jointe (expéditeur, alias → sens, octets `%PDF-`, taille, nombre de pages) et la dépose dans `scans_recus`. Aucune analyse. | `*/10 * * * *` |
-| `traitement_scans.py` | Rasterise le PDF, appelle le modèle vision sur **toutes les pages ensemble**, applique la règle de décision : création automatique du BL + notification Teams, ou mise en validation humaine avec le motif. | `5-59/10 * * * *` |
+| `traitement_scans.py` | **Découpe** le scan s'il contient plusieurs bordereaux (lecture page par page, puis règles de `segmentation.py`) ; pour chaque bordereau, appelle le modèle vision sur toutes ses pages ensemble et applique la règle de décision : création automatique du BL + notification Teams, ou mise en validation humaine avec le motif. Un découpage douteux part en confirmation humaine. | `5-59/10 * * * *` |
 | `sync_referentiels_erp.py` | Historise le staging Delta, synchronise tiers et DESADV achat par lots (avec `statut_edi` issu de `messagestate`), gère renommages/inactivations et recalcule le rapprochement BL ⇄ DESADV dans les deux sens. | quotidienne, 05h30 |
 | `rapports_activite.py` | Produit les rapports d'activité PDF **échus** (journalier de la veille, plus hebdo/mensuel/trimestriel/annuel dès qu'ils se clôturent), analyse rédigée par le modèle comprise. | quotidienne, 03h30 |
 | `maintenance.py` | Brouillons interrompus, exécutions de job restées `STARTED`, **verrous de validation oubliés**, **analyses interrompues** (`EN_ANALYSE` → `RECU`) et **purge du PDF source** des scans terminés. | quotidienne, 04h00 |
@@ -62,7 +62,7 @@ Ces clés sont communes à tous les scripts :
 | `expediteurs_autorises` | *(vide = pas de filtre)* ; CSV d'adresses |
 | `max_messages` | `50` messages par relève |
 | `max_octets_pdf` | `41943040` (40 Mo) |
-| `max_pages` | `25` pages pour un seul BL |
+| `max_pages` | `60` — pages par **scan**. Un scan peut contenir plusieurs bordereaux : c'est `traitement_scans` qui le découpe. |
 
 Le secret du service principal Entra ID est lu dans un **secret scope
 Databricks** : c'est le seul secret de la solution. Le *Run as* du job doit
@@ -77,8 +77,19 @@ manque, le message d'erreur porte la commande exacte à lancer.
 | `llm_endpoint` | `databricks-claude-opus-4-8` — **vide = tous les scans partent en validation, sans pré-remplissage** |
 | `teams_webhook_reception` | URL du flux Teams *(facultatif)* |
 | `auto_sans_desadv` | `false` — création automatique sur code tiers reconnu **sans** avis d'expédition. Laisser `false` jusqu'à avoir mesuré la précision réelle sur votre parc. |
-| `max_scans` | `40` (1–500) scans par exécution |
+| `max_scans` | `40` (1–500) scans par exécution — les bordereaux issus d'un lot comptent chacun pour un |
 | `dpi` | `150` (72–400) pour la rasterisation |
+| `multi_bl` | `true` — découpe les scans de plusieurs bordereaux. `false` : un scan est toujours UN bordereau (comportement d'origine, aucune lecture page par page). |
+| `multi_bl_auto` | `true` — un lot dont le découpage ne présente aucun doute est réparti sans intervention. `false` : tout lot de plusieurs BL est confirmé par un gestionnaire. |
+| `max_pages_bl` | `25` (1–100) — au-delà, un groupe est jugé anormalement long dans un lot (coupe manquée ?) |
+| `max_pages_lot` | `60` (1–200) — plafond de pages d'un scan ; même valeur que `max_pages` de l'ingestion |
+
+Ce job exige la migration **`V002__scans_multi_bl.sql`** : il le vérifie au
+démarrage et s'arrête avec un message explicite si elle manque.
+
+Coût : la lecture page par page ajoute **un appel au modèle par page** (hors
+pages blanches), en plus de l'extraction par bordereau. Les pages d'un scan
+sont lues en parallèle, par quatre.
 
 `auto_sans_desadv` doit rester **cohérent** avec `BL_SCAN_AUTO_SANS_DESADV` de
 l'`app.yaml`, sinon l'écran de validation explique un garde-fou qui n'est plus
@@ -178,7 +189,7 @@ pandas==2.2.3           # rapports_activite
 fpdf2==2.8.7            # rapports_activite
 ```
 
-Déposer alors `shared/bl_core/` **à côté** du script dans l'espace de travail
+Déposer alors `shared/bl_core/` — **en entier**, les 19 fichiers — **à côté** du script dans l'espace de travail
 (ou l'ajouter au `sys.path` de la tâche). Aucune logique métier n'est dupliquée
 dans les jobs : c'est le **même** `decision.py` et le même `extraction.py` que
 l'application. `cache.py` bascule automatiquement sur `functools.lru_cache` hors
