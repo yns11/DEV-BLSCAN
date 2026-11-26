@@ -1,14 +1,15 @@
 """Lecture du PDF d'un scan et pré-analyse anticipée des scans à valider.
 
-Ici, **un PDF = UN bordereau**, de 1 à 25 pages : le réceptionniste scanne un
-BL à la fois. Toutes les pages d'un même scan sont donc analysées ENSEMBLE par
-le modèle, exactement comme un BL photographié en plusieurs prises dans les
-versions précédentes.
+Un PDF est soit **un bordereau** (1 à 25 pages), soit **un lot** de plusieurs
+bordereaux passés ensemble au copieur. Le découpage d'un lot est décidé par
+`segmentation.py` ; ce module fournit les opérations sur le PDF lui-même.
 
-Deux responsabilités, sans aucune dépendance à Streamlit :
+Sans aucune dépendance à Streamlit :
 
 * `rasteriser` — transforme le PDF en une image JPEG par page, calibrée pour
   l'affichage et pour le modèle de vision ;
+* `extraire_pages` — fabrique le PDF d'un groupe de pages (un BL d'un lot) ;
+* `est_blanche` — repère un verso vide sans interroger le modèle ;
 * `Prechargeur` — dans l'écran de validation, analyse **les scans suivants en
   avance** pendant que le gestionnaire traite le scan courant, de sorte que le
   passage au suivant n'attende pratiquement jamais le modèle.
@@ -57,7 +58,7 @@ def compter_pages(pdf: bytes) -> int:
 
 
 def rasteriser(pdf: bytes, dpi: int = 150, qualite: int = 72,
-               progression=None) -> list[bytes]:
+               progression=None, max_pages: int | None = None) -> list[bytes]:
     """Une image JPEG par page du PDF, dans l'ordre du document.
 
     `dpi` 150 est le compromis retenu : suffisant pour qu'un modèle de vision
@@ -66,6 +67,8 @@ def rasteriser(pdf: bytes, dpi: int = 150, qualite: int = 72,
     tant qu'elles dépassent `BL_MAX_IMAGE_BYTES`.
 
     `progression(index, total)` est appelé après chaque page (barre d'avancement).
+    `max_pages` : plafond de pages ; par défaut celui d'un lot
+    (`BL_SCAN_MAX_PAGES_LOT`), un scan pouvant contenir plusieurs bordereaux.
     """
     from PIL import Image
 
@@ -75,11 +78,11 @@ def rasteriser(pdf: bytes, dpi: int = 150, qualite: int = 72,
         total = document.page_count
         if total == 0:
             raise ValueError("Ce PDF ne contient aucune page.")
-        if total > parametres.scan_max_pages:
+        limite = max_pages or parametres.scan_max_pages_lot
+        if total > limite:
             raise ValueError(
                 f"Ce PDF contient {total} pages ; la limite est de "
-                f"{parametres.scan_max_pages} pages pour un bordereau. "
-                "Un scan doit contenir UN seul BL.")
+                f"{limite} pages par scan.")
         pages = []
         for index in range(total):
             pixmap = document[index].get_pixmap(dpi=dpi)
@@ -106,6 +109,65 @@ def _compresser(image, qualite: int, taille_max: int) -> bytes:
         if len(donnees) <= taille_max:
             return donnees
     return donnees                                 # dernier essai, au plus léger
+
+
+def extraire_pages(pdf: bytes, pages: list[int]) -> bytes:
+    """PDF réduit aux pages demandées (index à partir de 0), dans cet ordre.
+
+    Sert à découper un lot : chaque bordereau devient un PDF autonome, que le
+    reste du pipeline traite comme n'importe quel scan d'un seul BL."""
+    if not pages:
+        raise ValueError("Aucune page à extraire.")
+    document = _ouvrir(pdf)
+    try:
+        total = document.page_count
+        hors_bornes = [p for p in pages if p < 0 or p >= total]
+        if hors_bornes:
+            raise ValueError(
+                f"Page(s) {[p + 1 for p in hors_bornes]} hors du PDF "
+                f"({total} page(s)).")
+        document.select(list(pages))
+        return document.tobytes(garbage=3, deflate=True)
+    finally:
+        document.close()
+
+
+def est_blanche(image: bytes) -> bool:
+    """Vrai si la page est vide (verso d'un recto-verso, intercalaire).
+
+    Le critère n'est pas la QUANTITÉ de pixels sombres mais leur
+    REGROUPEMENT : la page est quadrillée en petites zones, et une seule zone
+    contenant de l'encre groupée suffit à la dire écrite. Un mot isolé
+    (« NOK », une signature, une réserve manuscrite) forme un amas ; des
+    poussières de scanner restent des points épars. Un simple pourcentage de
+    noir ne sait pas les distinguer — deux lettres pèsent moins que trente
+    poussières.
+
+    Les marges sont exclues (ombre de reliure, trace d'agrafe). En cas de
+    doute ou d'erreur, la page est réputée NON blanche — le modèle tranchera :
+    écarter à tort une page écrite serait pire que payer un appel de trop."""
+    try:
+        from PIL import Image
+
+        vue = Image.open(io.BytesIO(image)).convert("L")
+        vue.thumbnail((1000, 1000))
+        largeur, hauteur = vue.size
+        marge_x, marge_y = int(largeur * 0.06), int(hauteur * 0.06)
+        coeur = vue.crop((marge_x, marge_y, largeur - marge_x, hauteur - marge_y))
+        if coeur.size[0] < _ZONE or coeur.size[1] < _ZONE:
+            return False
+        # Masque des pixels sombres, puis moyenne par zone : chaque pixel de
+        # la grille vaut 255 x (part de pixels sombres de sa zone).
+        masque = coeur.point(lambda valeur: 255 if valeur < 128 else 0)
+        grille = masque.resize((coeur.size[0] // _ZONE, coeur.size[1] // _ZONE),
+                               Image.BOX)
+        return max(grille.getdata()) < _ENCRE_MIN
+    except Exception:
+        return False
+
+
+_ZONE = 40          # côté d'une zone, en pixels (page ramenée à 1000 px)
+_ENCRE_MIN = 2      # ~12 pixels sombres dans une zone de 1600 : de l'encre
 
 
 # ---------------------------------------------------------------------------

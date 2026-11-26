@@ -157,13 +157,18 @@ def json_metrics(**values) -> str:
 SYMBOLES_REQUIS = {
     "decision": ("decider", "sens_du_destinataire", "plage_horaire_de"),
     "extraction": ("Referentiel", "extraire_infos_bl", "CHAMPS_ATTENDUS",
-                   "rapprocher_tiers", "statut_est_nok", "endpoint_configure"),
+                   "rapprocher_tiers", "statut_est_nok", "endpoint_configure",
+                   "ficher_page"),
     "graph_mail": ("BoiteMail", "ErreurGraph"),
     "notifications": ("notifier_nouvelle_reception",),
     "rapports": ("generer_rapport",),
     "repository": ("enregistrer_scan", "prendre_scans_a_analyser",
-                   "cloturer_scan", "creer_bl_depuis_scan", "libelle_statut"),
-    "scan_pdf": ("rasteriser", "compter_pages"),
+                   "cloturer_scan", "creer_bl_depuis_scan", "libelle_statut",
+                   "creer_segments", "enregistrer_decoupage",
+                   "verifier_schema_multi_bl"),
+    "scan_pdf": ("rasteriser", "compter_pages", "extraire_pages", "est_blanche"),
+    "segmentation": ("ficher_lot", "decouper", "charges_segments",
+                     "pages_a_analyser"),
 }
 
 
@@ -194,7 +199,7 @@ def verifier_bl_core(*modules: str) -> None:
             "La copie de bl_core de ce dossier est incomplète ou obsolète — "
             "des symboles attendus sont absents :\n  - "
             + "\n  - ".join(manquants)
-            + "\nRedéployez le dossier bl_core/ ENTIER (les 18 fichiers de "
+            + "\nRedéployez le dossier bl_core/ ENTIER (les 19 fichiers de "
               "shared/bl_core/), et non quelques fichiers isolés : mélanger "
               "deux versions produit des erreurs très éloignées de leur cause."
         )

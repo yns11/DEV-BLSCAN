@@ -44,7 +44,9 @@ def _connection_kwargs() -> dict[str, Any]:
     settings = get_settings()
     dsn = os.environ.get("BL_DATABASE_DSN", "").strip()
     if dsn:
-        return {"conninfo": dsn}
+        # Même fabrique de lignes que la connexion Lakebase : sans elle, les
+        # requêtes renvoient des tuples et `fetch_one` échoue.
+        return {"conninfo": dsn, "kwargs": {"row_factory": dict_row}}
     missing = [name for name in ("PGHOST", "PGDATABASE", "PGUSER") if not os.environ.get(name)]
     if missing:
         raise RuntimeError(

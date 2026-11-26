@@ -69,6 +69,9 @@ class Settings:
     max_dimension_px: int
     max_pages: int
     scan_max_pages: int
+    scan_max_pages_lot: int
+    scan_multi_bl: bool
+    scan_multi_bl_auto: bool
     scan_pages_avance: int
     scan_auto_sans_desadv: bool
     scan_alias_achat: str
@@ -127,10 +130,17 @@ def get_settings() -> Settings:
     )
 
     # --- Pipeline de scan -------------------------------------------------
-    # Un scan = UN bordereau, de 1 à 25 pages (5 en moyenne). Toutes ses pages
-    # sont analysées ENSEMBLE, comme le fait la saisie unitaire d'un BL
-    # multi-pages : c'est un seul document.
+    # Un BORDEREAU fait 1 à 25 pages (5 en moyenne) : ses pages sont analysées
+    # ENSEMBLE, c'est un seul document. Au-delà, dans un lot de plusieurs BL,
+    # un groupe est signalé comme anormalement long (coupe manquée ?).
     scan_max_pages = _int("BL_SCAN_MAX_PAGES", 25, 1, 100)
+    # Un SCAN peut contenir plusieurs bordereaux passés ensemble au copieur :
+    # c'est le plafond de pages du PDF reçu.
+    scan_max_pages_lot = _int("BL_SCAN_MAX_PAGES_LOT", 60, 1, 200)
+    if scan_max_pages_lot < scan_max_pages:
+        raise RuntimeError(
+            "BL_SCAN_MAX_PAGES_LOT (pages par scan) ne peut pas être inférieur "
+            "à BL_SCAN_MAX_PAGES (pages par bordereau).")
     # Scans pré-analysés en arrière-plan dans l'écran de validation, pendant
     # que le gestionnaire traite le scan courant.
     scan_pages_avance = _int("BL_SCAN_PAGES_AVANCE", 1, 0, 4)
@@ -178,6 +188,9 @@ def get_settings() -> Settings:
         max_dimension_px=_int("BL_MAX_DIMENSION_PX", 3508, 1024, 10000),
         max_pages=max_pages,
         scan_max_pages=scan_max_pages,
+        scan_max_pages_lot=scan_max_pages_lot,
+        scan_multi_bl=_bool("BL_SCAN_MULTI_BL", True),
+        scan_multi_bl_auto=_bool("BL_SCAN_MULTI_BL_AUTO", True),
         scan_pages_avance=scan_pages_avance,
         scan_auto_sans_desadv=scan_auto_sans_desadv,
         scan_alias_achat=scan_alias_achat,

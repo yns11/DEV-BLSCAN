@@ -714,14 +714,33 @@ STATUT_SCAN_A_VALIDER = "A_VALIDER"
 STATUT_SCAN_VALIDE = "VALIDE"
 STATUT_SCAN_REJETE = "REJETE"
 STATUT_SCAN_ERREUR = "ERREUR"
+# Lots de plusieurs bordereaux (migration V002).
+STATUT_SCAN_A_DECOUPER = "A_DECOUPER"   # découpage à confirmer par un humain
+STATUT_SCAN_DECOUPE = "DECOUPE"         # lot réparti en scans fils
 
 # Colonnes légères : la grille de supervision ne charge jamais le PDF.
 _COLONNES_SCAN = (
     "id, message_id, source, expediteur, destinataire, objet, nom_fichier, "
     "taille_octets, nb_pages, sens, recu_le, ingere_le, statut, confiance, "
     "motif_validation, id_bl, verrouille_par, verrouille_le, analyse_le, "
-    "traite_le, traite_par, tentatives, erreur"
+    "traite_le, traite_par, tentatives, erreur, id_parent, page_debut, page_fin"
 )
+
+
+def verifier_schema_multi_bl() -> None:
+    """Échoue avec un message clair si la migration V002 n'a pas été jouée.
+
+    Sans elle, la première requête sur la file lèverait un « column id_parent
+    does not exist » très loin de sa cause."""
+    s = get_settings()
+    try:
+        _run(f"SELECT id_parent, page_debut, page_fin, decoupage "
+             f"FROM {s.pg_schema}.scans_recus LIMIT 0", fetch=True)
+    except Exception as exc:
+        raise RuntimeError(
+            "La table scans_recus n'a pas les colonnes des lots multi-BL : "
+            "exécutez sql/migrations/V002__scans_multi_bl.sql dans l'éditeur "
+            f"SQL Lakebase ({type(exc).__name__} : {exc})") from exc
 
 
 def enregistrer_scan(message_id: str, source: str, expediteur: str,
@@ -773,10 +792,169 @@ def prendre_scans_a_analyser(limite: int = 20) -> list[dict]:
             "WHERE id = ANY(%(ids)s)", {"ids": ids})
         lignes = tx.fetch_dataframe(
             f"SELECT id, contenu, sens, nb_pages, recu_le, nom_fichier, "
-            f"expediteur FROM {s.pg_schema}.scans_recus "
-            "WHERE id = ANY(%(ids)s) ORDER BY recu_le", {"ids": ids})
-    return [{**ligne, "contenu": bytes(ligne["contenu"])}
+            f"expediteur, id_parent, decoupage FROM {s.pg_schema}.scans_recus "
+            "WHERE id = ANY(%(ids)s) ORDER BY recu_le, id", {"ids": ids})
+    return [{**ligne, "contenu": bytes(ligne["contenu"]),
+             # pandas rend NaN pour un entier absent : on normalise en None.
+             "id_parent": (None if pd.isna(ligne["id_parent"])
+                           else int(ligne["id_parent"])),
+             "decoupage": ligne["decoupage"] if isinstance(
+                 ligne["decoupage"], dict) else {}}
             for ligne in lignes.to_dict("records")]
+
+
+# ---------------------------------------------------------------------------
+# Lots de plusieurs bordereaux
+# ---------------------------------------------------------------------------
+def enregistrer_decoupage(scan_id: int, decoupage_json: dict, *,
+                          statut: str = "", motif: str = "",
+                          nb_pages: Optional[int] = None) -> None:
+    """Trace du découpage sur le lot (fiches des pages, coupes, incertitudes).
+
+    Avec `statut=A_DECOUPER`, le lot part en confirmation humaine ; sans
+    statut, seule la trace est écrite (lot d'un seul BL, traité dans la foulée).
+    """
+    s = get_settings()
+    _run(
+        f"UPDATE {s.pg_schema}.scans_recus SET decoupage = %(d)s::jsonb, "
+        "statut = COALESCE(NULLIF(%(st)s, ''), statut), "
+        "motif_validation = COALESCE(NULLIF(%(motif)s, ''), motif_validation), "
+        "nb_pages = COALESCE(%(pages)s, nb_pages), "
+        "verrouille_par = NULL, verrouille_le = NULL "
+        "WHERE id = %(id)s",
+        params={"id": scan_id, "st": statut, "motif": motif, "pages": nb_pages,
+                "d": json.dumps(decoupage_json, ensure_ascii=False, default=str)})
+
+
+def creer_segments(parent_id: int, charges: list[dict], utilisateur: str,
+                   decoupage_json: Optional[dict] = None) -> list[int]:
+    """Répartit un lot en scans fils — un par bordereau — en UNE transaction.
+
+    Chaque fils reprend les métadonnées du lot (sens, expéditeur, date de
+    réception) et entre dans la file à l'état RECU : il sera analysé comme
+    n'importe quel scan d'un seul BL. Le lot passe à DECOUPE.
+
+    Idempotent : la clé d'un fils dérive de celle du lot et de ses pages. Un
+    job interrompu puis relancé ne recrée pas les fils déjà présents.
+    Renvoie les ids des fils insérés."""
+    if not charges:
+        raise ValueError("Un découpage doit contenir au moins un groupe.")
+    s = get_settings()
+    with database.transaction() as tx:
+        parent = tx.fetch_one(
+            f"SELECT id, message_id, source, expediteur, destinataire, objet, "
+            f"nom_fichier, sens, recu_le, statut, id_parent "
+            f"FROM {s.pg_schema}.scans_recus WHERE id = %(id)s FOR UPDATE",
+            {"id": parent_id})
+        if parent is None:
+            raise ValueError(f"Scan {parent_id} introuvable.")
+        if parent["id_parent"] is not None:
+            raise ValueError("Un groupe issu d'un lot ne se redécoupe pas.")
+        if parent["statut"] not in (STATUT_SCAN_EN_ANALYSE, STATUT_SCAN_A_DECOUPER):
+            raise ValueError(
+                f"Le lot n'est plus à découper (statut {parent['statut']}).")
+        base, extension = parent["nom_fichier"], ""
+        if base.lower().endswith(".pdf"):
+            base, extension = base[:-4], base[-4:]
+        ids = []
+        for charge in charges:
+            debut, fin = int(charge["page_debut"]), int(charge["page_fin"])
+            etendue = f"p. {debut}" if debut == fin else f"p. {debut}-{fin}"
+            ligne = tx.fetch_one(
+                f"INSERT INTO {s.pg_schema}.scans_recus "
+                "(message_id, source, expediteur, destinataire, objet, "
+                " nom_fichier, contenu, taille_octets, nb_pages, sens, recu_le, "
+                " id_parent, page_debut, page_fin, decoupage) "
+                "VALUES (%(mid)s, %(src)s, %(exp)s, %(dest)s, %(obj)s, %(nom)s, "
+                "        %(c)s, %(taille)s, %(pages)s, %(sens)s, %(recu)s, "
+                "        %(parent)s, %(debut)s, %(fin)s, %(d)s::jsonb) "
+                "ON CONFLICT (message_id) DO NOTHING RETURNING id",
+                {"mid": f"{parent['message_id']}#p{debut}-{fin}",
+                 "src": parent["source"], "exp": parent["expediteur"],
+                 "dest": parent["destinataire"], "obj": parent["objet"],
+                 "nom": f"{base} [{etendue}]{extension}",
+                 "c": charge["contenu"], "taille": len(charge["contenu"]),
+                 "pages": charge.get("nb_pages"), "sens": parent["sens"],
+                 "recu": parent["recu_le"], "parent": parent_id,
+                 "debut": debut, "fin": fin,
+                 "d": json.dumps(charge.get("decoupage") or {},
+                                 ensure_ascii=False, default=str)})
+            if ligne:
+                ids.append(int(ligne["id"]))
+        tx.execute(
+            f"UPDATE {s.pg_schema}.scans_recus SET statut = 'DECOUPE', "
+            "traite_le = now(), traite_par = %(par)s, "
+            "decoupage = COALESCE(%(d)s::jsonb, decoupage), "
+            "motif_validation = NULL, erreur = NULL, "
+            "verrouille_par = NULL, verrouille_le = NULL WHERE id = %(id)s",
+            {"id": parent_id, "par": utilisateur,
+             "d": json.dumps(decoupage_json, ensure_ascii=False, default=str)
+                  if decoupage_json is not None else None})
+    return ids
+
+
+def segments_du_lot(parent_id: int) -> pd.DataFrame:
+    """Les scans fils d'un lot, dans l'ordre des pages (sans leur PDF)."""
+    s = get_settings()
+    return _run(
+        f"SELECT {_COLONNES_SCAN} FROM {s.pg_schema}.scans_recus "
+        "WHERE id_parent = %(id)s ORDER BY page_debut",
+        params={"id": parent_id}, fetch=True)
+
+
+def rouvrir_decoupage(parent_id: int, utilisateur: str) -> str:
+    """Annule le découpage d'un lot pour le refaire à la main.
+
+    Possible tant qu'AUCUN bordereau n'a été créé à partir du lot : les
+    groupes sont alors supprimés et le lot revient en confirmation. Renvoie
+    une chaîne vide en cas de succès, sinon la raison du refus — on ne défait
+    jamais un découpage dont un BL existe déjà."""
+    s = get_settings()
+    with database.transaction() as tx:
+        parent = tx.fetch_one(
+            f"SELECT statut, length(contenu) AS taille "
+            f"FROM {s.pg_schema}.scans_recus WHERE id = %(id)s FOR UPDATE",
+            {"id": parent_id})
+        if parent is None or parent["statut"] != STATUT_SCAN_DECOUPE:
+            return "Ce lot n'est pas dans l'état « découpé »."
+        if int(parent["taille"] or 0) <= 1:
+            return ("Le PDF du lot a été purgé (délai de conservation "
+                    "dépassé) : il ne peut plus être redécoupé.")
+        fils = tx.fetch_dataframe(
+            f"SELECT id, statut, id_bl FROM {s.pg_schema}.scans_recus "
+            "WHERE id_parent = %(id)s FOR UPDATE", {"id": parent_id})
+        for _, ligne in (fils.iterrows() if fils is not None else []):
+            if ligne["statut"] in (STATUT_SCAN_AUTO, STATUT_SCAN_VALIDE) \
+                    or not pd.isna(ligne["id_bl"]):
+                return ("Un BL a déjà été créé à partir de ce lot : le "
+                        "découpage ne peut plus être refait.")
+            if ligne["statut"] == STATUT_SCAN_EN_ANALYSE:
+                return ("Le pipeline analyse ce lot en ce moment : réessayez "
+                        "dans quelques minutes.")
+        tx.execute(f"DELETE FROM {s.pg_schema}.scans_recus "
+                   "WHERE id_parent = %(id)s", {"id": parent_id})
+        tx.execute(
+            f"UPDATE {s.pg_schema}.scans_recus SET statut = 'A_DECOUPER', "
+            "motif_validation = %(motif)s, traite_le = NULL, "
+            "verrouille_par = %(u)s, verrouille_le = now() WHERE id = %(id)s",
+            {"id": parent_id, "u": utilisateur,
+             "motif": f"Découpage rouvert par {utilisateur}."})
+    return ""
+
+
+def stats_lots(depuis: datetime.date) -> dict:
+    """Compteurs propres aux lots : scans physiques reçus du copieur, lots de
+    plusieurs BL, bordereaux qui en sont issus."""
+    s = get_settings()
+    df = _run(
+        f"SELECT count(*) FILTER (WHERE id_parent IS NULL) AS scans, "
+        "count(*) FILTER (WHERE statut IN ('DECOUPE', 'A_DECOUPER')) AS lots, "
+        "count(*) FILTER (WHERE id_parent IS NOT NULL) AS issus "
+        f"FROM {s.pg_schema}.scans_recus WHERE recu_le >= %(d)s",
+        params={"d": depuis}, fetch=True)
+    if df is None or df.empty:
+        return {"scans": 0, "lots": 0, "issus": 0}
+    return {cle: int(df[cle].iloc[0] or 0) for cle in ("scans", "lots", "issus")}
 
 
 def cloturer_scan(scan_id: int, statut: str, *, confiance: str = "",
@@ -826,7 +1004,7 @@ def lister_scans(statuts: Optional[list[str]] = None, sens: str = "",
         conditions.append("recu_le < %(dmax)s")
         params["dmax"] = date_max + datetime.timedelta(days=1)
     return _run(
-        f"SELECT {_COLONNES_SCAN}, extraction "
+        f"SELECT {_COLONNES_SCAN}, extraction, decoupage "
         f"FROM {s.pg_schema}.scans_recus WHERE {' AND '.join(conditions)} "
         "ORDER BY recu_le DESC LIMIT %(lim)s", params=params, fetch=True)
 
@@ -836,7 +1014,7 @@ def telecharger_scan(scan_id: int) -> Optional[dict]:
     s = get_settings()
     with database.transaction() as tx:
         ligne = tx.fetch_one(
-            f"SELECT {_COLONNES_SCAN}, extraction, contenu "
+            f"SELECT {_COLONNES_SCAN}, extraction, decoupage, contenu "
             f"FROM {s.pg_schema}.scans_recus WHERE id = %(id)s", {"id": scan_id})
     if ligne is None:
         return None
@@ -846,7 +1024,7 @@ def telecharger_scan(scan_id: int) -> Optional[dict]:
 
 def verrouiller_scan(scan_id: int, utilisateur: str,
                      expiration_minutes: int = 60) -> bool:
-    """Prise en charge exclusive d'un scan à valider.
+    """Prise en charge exclusive d'un scan à valider ou d'un lot à découper.
 
     Renvoie False si un autre gestionnaire l'a déjà pris et que son verrou
     n'a pas expiré — l'appelant affiche alors un message plutôt que d'ouvrir
@@ -856,7 +1034,7 @@ def verrouiller_scan(scan_id: int, utilisateur: str,
         touchees = tx.execute(
             f"UPDATE {s.pg_schema}.scans_recus "
             "SET verrouille_par = %(u)s, verrouille_le = now() "
-            "WHERE id = %(id)s AND statut = 'A_VALIDER' "
+            "WHERE id = %(id)s AND statut IN ('A_VALIDER', 'A_DECOUPER') "
             "  AND (verrouille_par IS NULL OR verrouille_par = %(u)s "
             "       OR verrouille_le < now() - make_interval(mins => %(exp)s))",
             {"id": scan_id, "u": utilisateur, "exp": expiration_minutes})
@@ -880,7 +1058,7 @@ def purger_contenu_scans(jours: int) -> int:
         return tx.execute(
             f"UPDATE {s.pg_schema}.scans_recus SET contenu = ''::bytea, "
             "taille_octets = 1 "
-            "WHERE statut IN ('TRAITE_AUTO', 'VALIDE', 'REJETE') "
+            "WHERE statut IN ('TRAITE_AUTO', 'VALIDE', 'REJETE', 'DECOUPE') "
             "  AND traite_le < now() - make_interval(days => %(j)s) "
             "  AND length(contenu) > 1", {"j": jours})
 
@@ -916,7 +1094,8 @@ def liberer_scans_abandonnes(heures: int) -> int:
         verrous = tx.execute(
             f"UPDATE {s.pg_schema}.scans_recus "
             "SET verrouille_par = NULL, verrouille_le = NULL "
-            "WHERE statut = 'A_VALIDER' AND verrouille_le IS NOT NULL "
+            "WHERE statut IN ('A_VALIDER', 'A_DECOUPER') "
+            "  AND verrouille_le IS NOT NULL "
             "  AND verrouille_le < now() - make_interval(hours => %(h)s)",
             {"h": heures})
         analyses = tx.execute(

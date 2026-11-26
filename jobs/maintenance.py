@@ -132,7 +132,8 @@ def main() -> None:
                 cursor.execute(
                     f"UPDATE {args.pg_schema}.scans_recus "
                     "SET verrouille_par = NULL, verrouille_le = NULL "
-                    "WHERE statut = 'A_VALIDER' AND verrouille_le IS NOT NULL "
+                    "WHERE statut IN ('A_VALIDER', 'A_DECOUPER') "
+                    "  AND verrouille_le IS NOT NULL "
                     "  AND verrouille_le < now() - make_interval(hours => %s)",
                     (args.scan_verrou_heures,))
                 debloques = cursor.rowcount
@@ -147,7 +148,8 @@ def main() -> None:
                 cursor.execute(
                     f"UPDATE {args.pg_schema}.scans_recus "
                     "SET contenu = ''::bytea, taille_octets = 1 "
-                    "WHERE statut IN ('TRAITE_AUTO', 'VALIDE', 'REJETE') "
+                    "WHERE statut IN ('TRAITE_AUTO', 'VALIDE', 'REJETE', "
+                    "                 'DECOUPE') "
                     "  AND traite_le < now() - make_interval(days => %s) "
                     "  AND length(contenu) > 1",
                     (args.retention_pdf_jours,))

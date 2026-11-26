@@ -22,7 +22,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 from bl_core import (extraction, notifications, pdf_bl, rapports, rbac,
-                     repository, scan_pdf, ui)
+                     repository, scan_pdf, segmentation, ui)
 from bl_core.config import get_settings
 from bl_core.identity import get_current_user
 
@@ -1800,13 +1800,16 @@ def vue_rapports() -> None:
 
 
 # =====================================================================
-# VUE « SCANS À VALIDER » — un scan = un BL multi-pages
+# VUE « SCANS À VALIDER » — bordereaux à confirmer et lots à découper
 # =====================================================================
 # Le pipeline (jobs/traitement_scans.py) a déjà analysé chaque scan et n'a
-# renvoyé ici que ceux dont le rapprochement était insuffisant. Le
-# gestionnaire corrige les champs pré-remplis et crée le BL — ou écarte le
-# scan. L'analyse n'est PAS refaite à l'ouverture : elle est lue depuis la
-# colonne `extraction`, ce qui rend l'écran instantané et sans coût.
+# renvoyé ici que deux sortes de travail :
+#   * un BORDEREAU dont le rapprochement était insuffisant — le gestionnaire
+#     corrige les champs pré-remplis et crée le BL, ou écarte le scan ;
+#   * un LOT de plusieurs bordereaux dont le découpage est douteux — le
+#     gestionnaire confirme où commence chaque BL.
+# L'analyse n'est PAS refaite à l'ouverture : elle est lue depuis les colonnes
+# `extraction` et `decoupage`, ce qui rend l'écran instantané et sans coût.
 def _scan_referentiel(type_tiers: str, sens: str):
     """Même contexte de rapprochement que le job : liste des tiers, adresses
     de sites, numéros de BL connus par tiers."""
@@ -1861,9 +1864,10 @@ def vue_validation_scans(sens: str) -> None:
 
     try:
         df = repository.lister_scans(
-            statuts=[repository.STATUT_SCAN_A_VALIDER], sens=sens)
+            statuts=[repository.STATUT_SCAN_A_VALIDER,
+                     repository.STATUT_SCAN_A_DECOUPER], sens=sens)
     except Exception as exc:
-        st.error(f"Erreur de lecture : {exc} (migration V001 exécutée ?)")
+        st.error(f"Erreur de lecture : {exc} (migrations V001 et V002 exécutées ?)")
         st.stop()
 
     ouvert = st.session_state.get("scan_ouvert")
@@ -1884,8 +1888,9 @@ def vue_validation_scans(sens: str) -> None:
             st.success("✅ Aucun scan en attente de validation.")
             return
         st.metric("Scans à valider", len(df))
+        df = df.assign(nature=[_nature_scan(ligne) for _, ligne in df.iterrows()])
         selection = st.dataframe(
-            df[["recu_le", "nom_fichier", "nb_pages", "confiance",
+            df[["recu_le", "nature", "nom_fichier", "nb_pages", "confiance",
                 "motif_validation", "verrouille_par"]],
             hide_index=True, width="stretch", height=min(430, 60 + 36 * len(df)),
             on_select="rerun", selection_mode="single-row",
@@ -1893,6 +1898,7 @@ def vue_validation_scans(sens: str) -> None:
             column_config={
                 "recu_le": st.column_config.DatetimeColumn(
                     "Reçu le", format="DD/MM/YYYY HH:mm"),
+                "nature": st.column_config.TextColumn("À faire"),
                 "nom_fichier": st.column_config.TextColumn("Fichier", width="medium"),
                 "nb_pages": st.column_config.NumberColumn("Pages"),
                 "confiance": st.column_config.TextColumn("Confiance"),
@@ -1907,7 +1913,9 @@ def vue_validation_scans(sens: str) -> None:
             return
         scan = df.iloc[lignes[0]]
         actions = st.columns([2, 2, 4])
-        if actions[0].button("📖 Prendre en charge", type="primary",
+        est_lot = scan["statut"] == repository.STATUT_SCAN_A_DECOUPER
+        if actions[0].button("✂️ Découper le lot" if est_lot
+                             else "📖 Prendre en charge", type="primary",
                              width="stretch", disabled=LECTURE_SEULE):
             if repository.verrouiller_scan(int(scan["id"]), utilisateur,
                                            SETTINGS.scan_verrou_minutes):
@@ -1926,14 +1934,23 @@ def vue_validation_scans(sens: str) -> None:
     # Écran de validation d'UN scan
     # -----------------------------------------------------------------
     detail = repository.telecharger_scan(ouvert)
-    if detail is None or detail["statut"] != repository.STATUT_SCAN_A_VALIDER:
+    if detail is None or detail["statut"] not in (
+            repository.STATUT_SCAN_A_VALIDER, repository.STATUT_SCAN_A_DECOUPER):
         st.session_state.pop("scan_ouvert", None)
         st.info("Ce scan n'est plus à valider (déjà traité par ailleurs).")
         st.rerun()
 
     pages = _scan_pages(ouvert, detail["contenu"])
+    if detail["statut"] == repository.STATUT_SCAN_A_DECOUPER:
+        ecran_decoupage(detail, pages)
+        return
     tous_tiers, referentiel = _scan_referentiel(type_tiers, sens)
     infos = detail.get("extraction") or {}
+    # Bordereau issu d'un lot : ses annexes ne sont pas relues comme des pages
+    # de BL, et il peut être rendu au lot tant qu'aucun BL n'en est sorti.
+    meta = detail.get("decoupage") or {}
+    id_lot = detail.get("id_parent")
+    id_lot = None if id_lot is None or pd.isna(id_lot) else int(id_lot)
 
     gauche, droite = st.columns([1, 2.3], gap="medium")
 
@@ -1941,6 +1958,11 @@ def vue_validation_scans(sens: str) -> None:
         st.markdown(f"#### Scan « {detail['nom_fichier']} »")
         st.caption(f"Reçu le {detail['recu_le']:%d/%m/%Y à %H:%M} de "
                    f"{detail['expediteur'] or '—'} · {len(pages)} page(s)")
+        if id_lot is not None:
+            st.caption(f"📑 Bordereau {meta.get('rang', '?')} sur "
+                       f"{meta.get('total', '?')} d'un lot — pages "
+                       f"{detail.get('page_debut')} à {detail.get('page_fin')} "
+                       "du scan d'origine.")
         if detail.get("motif_validation"):
             st.warning(f"**Pourquoi cette validation :** "
                        f"{detail['motif_validation']}")
@@ -1952,7 +1974,8 @@ def vue_validation_scans(sens: str) -> None:
             with st.spinner("Analyse des pages du bordereau…"):
                 try:
                     frais = extraction.extraire_infos_bl(
-                        pages, tiers_libelle.lower(), referentiel)
+                        segmentation.pages_a_analyser(pages, meta),
+                        tiers_libelle.lower(), referentiel)
                     repository.cloturer_scan(
                         ouvert, repository.STATUT_SCAN_A_VALIDER,
                         extraction_json={**infos, **frais},
@@ -2077,6 +2100,172 @@ def vue_validation_scans(sens: str) -> None:
         st.session_state.pop("scan_ouvert", None)
         st.session_state.pop("scan_pages_cache", None)
         st.rerun()
+    if id_lot is not None and actions[3].button(
+            "✂️ Revoir le découpage du lot", disabled=LECTURE_SEULE,
+            help="Ce bordereau contient une page d'un autre BL, ou il lui en "
+                 "manque une ? Rouvre le lot entier pour déplacer les coupes. "
+                 "Possible tant qu'aucun BL n'a été créé à partir du lot."):
+        rbac.exiger_vue(vue, CTX_RBAC, rbac.MODIFICATION)
+        refus = repository.rouvrir_decoupage(id_lot, utilisateur)
+        if refus:
+            st.warning(refus)
+        else:
+            st.session_state.scan_ouvert = id_lot
+            st.session_state.pop("scan_pages_cache", None)
+            st.rerun()
+
+
+# ---------------------------------------------------------------------
+# Écran de découpage d'un lot de plusieurs bordereaux
+# ---------------------------------------------------------------------
+_PASTILLES = ["🟦", "🟩", "🟪", "🟧"]
+_PAGES_PAR_LIGNE = 6
+
+
+def _nature_scan(ligne) -> str:
+    """Ce qu'il y a à faire sur une ligne de la file."""
+    if ligne.get("statut") == repository.STATUT_SCAN_A_DECOUPER:
+        return "✂️ Lot à découper"
+    parent = ligne.get("id_parent")
+    if parent is not None and not pd.isna(parent):
+        debut, fin = ligne.get("page_debut"), ligne.get("page_fin")
+        return f"📑 BL d'un lot (p. {int(debut)}-{int(fin)})"
+    return "📄 BL à valider"
+
+
+def ecran_decoupage(detail: dict, pages: list[bytes]) -> None:
+    """Le gestionnaire confirme où commence chaque bordereau du lot.
+
+    L'écran part de la proposition du pipeline (fiches des pages et coupes,
+    lues dans la colonne `decoupage` — aucun appel au modèle). Chaque groupe
+    confirmé devient un scan à part, analysé au passage suivant du pipeline."""
+    scan_id = int(detail["id"])
+    trace = detail.get("decoupage") or {}
+    fiches = segmentation.fiches_depuis_json(trace.get("fiches"), len(pages))
+    proposition_debuts = set(trace.get("debuts") or []) | {0}
+    proposition_ecartees = set(trace.get("ecartees") or [])
+
+    # Les cases à cocher sont indexées par « essai » : l'incrémenter les
+    # recrée toutes à leur valeur d'origine (« Revenir à la proposition »).
+    etat = st.session_state.setdefault("decoupage_etat", {})
+    if etat.get("scan") != scan_id:
+        etat.clear()
+        etat.update(scan=scan_id, essai=0)
+    essai = etat["essai"]
+
+    def _cle(nom: str, index: int) -> str:
+        return f"dec_{nom}_{scan_id}_{essai}_{index}"
+
+    def _coche(nom: str, index: int, defaut: bool) -> bool:
+        return bool(st.session_state.get(_cle(nom, index), defaut))
+
+    debuts = {i for i in range(len(pages))
+              if i == 0 or _coche("debut", i, i in proposition_debuts)}
+    ecartees = {i for i in range(len(pages))
+                if _coche("ecart", i, i in proposition_ecartees)}
+    decoupage = segmentation.recomposer(fiches, debuts, ecartees)
+    groupe_de = {page: rang for rang, segment in enumerate(decoupage.segments)
+                 for page in segment.pages}
+
+    st.markdown(f"#### Lot « {detail['nom_fichier']} » · {len(pages)} pages")
+    st.caption(f"Reçu le {detail['recu_le']:%d/%m/%Y à %H:%M} de "
+               f"{detail['expediteur'] or '—'}. Ce scan contient plusieurs "
+               "bordereaux : cochez **« Nouveau BL ici »** sur la première page "
+               "de chacun. Une annexe (lettre de voiture…) reste avec le BL "
+               "qui la précède.")
+    if detail.get("motif_validation"):
+        st.warning(f"**Pourquoi cette confirmation :** "
+                   f"{detail['motif_validation']}")
+
+    for debut_ligne in range(0, len(pages), _PAGES_PAR_LIGNE):
+        colonnes = st.columns(_PAGES_PAR_LIGNE)
+        for position, index in enumerate(
+                range(debut_ligne, min(debut_ligne + _PAGES_PAR_LIGNE, len(pages)))):
+            with colonnes[position]:
+                rang = groupe_de.get(index)
+                appartenance = ("⬜ écartée" if rang is None else
+                                f"{_PASTILLES[rang % len(_PASTILLES)]} BL {rang + 1}")
+                st.markdown(f"**Page {index + 1}** · {appartenance}")
+                st.image(pages[index], width="stretch")
+                st.caption(fiches[index].libelle())
+                st.checkbox("✂️ Nouveau BL ici", key=_cle("debut", index),
+                            value=index in proposition_debuts,
+                            disabled=index == 0 or LECTURE_SEULE)
+                st.checkbox("Écarter la page", key=_cle("ecart", index),
+                            value=index in proposition_ecartees,
+                            disabled=LECTURE_SEULE,
+                            help="Page blanche, intercalaire, document étranger "
+                                 "au lot : elle n'entrera dans aucun BL.")
+
+    st.divider()
+    st.markdown(f"##### {len(decoupage.segments)} bordereau(x) obtenu(s)")
+    if decoupage.segments:
+        st.dataframe(pd.DataFrame([{
+            "BL": f"{_PASTILLES[rang % len(_PASTILLES)]} {rang + 1}",
+            "Pages": segment.etendue(),
+            "Numéro lu": segment.numero or "—",
+            "Tiers lu": segment.tiers or "—",
+            "Annexes": len(segment.annexes),
+        } for rang, segment in enumerate(decoupage.segments)]),
+            hide_index=True, width="stretch")
+    else:
+        st.error("⛔ Toutes les pages sont écartées : il ne reste aucun "
+                 "bordereau. Utilisez « Écarter » pour rejeter le scan entier.")
+
+    for alerte in decoupage.incertitudes:
+        st.warning(f"⚠️ {alerte}")
+    confirme = True
+    if decoupage.incertitudes:
+        confirme = st.checkbox(
+            "Je confirme ce découpage malgré les alertes",
+            key=f"dec_force_{scan_id}_{essai}",
+            help="Le modèle a pu mal lire un numéro : vous restez juge.")
+
+    actions = st.columns([2.6, 2.2, 1.4, 1.8, 1])
+    if actions[0].button(
+            f"✅ Confirmer le découpage ({len(decoupage.segments)} BL)",
+            type="primary", width="stretch",
+            disabled=LECTURE_SEULE or not decoupage.segments or not confirme):
+        rbac.exiger_vue(vue, CTX_RBAC, rbac.MODIFICATION)
+        try:
+            charges = segmentation.charges_segments(
+                decoupage,
+                lambda index: scan_pdf.extraire_pages(detail["contenu"], index))
+            repository.creer_segments(
+                scan_id, charges, utilisateur,
+                {**trace, "debuts": decoupage.debuts,
+                 "ecartees": sorted(ecartees), "confirme_par": utilisateur})
+        except Exception as exc:
+            st.error(f"Découpage impossible : {exc}")
+        else:
+            st.session_state.pop("scan_ouvert", None)
+            st.session_state.pop("scan_pages_cache", None)
+            st.session_state.pop("decoupage_etat", None)
+            ui.set_flash(
+                "toast", f"Lot découpé en {len(charges)} bordereau(x) : analyse "
+                         "au prochain passage du pipeline (10 minutes environ)")
+            st.rerun()
+    if actions[1].button("↩️ Revenir à la proposition", width="stretch"):
+        etat["essai"] = essai + 1
+        st.rerun()
+    if actions[2].button("🗑️ Écarter", width="stretch", disabled=LECTURE_SEULE,
+                         key=f"dec_ecarter_{scan_id}"):
+        dialog_ecarter_scan(scan_id, detail["nom_fichier"])
+    if actions[3].button("↩️ Rendre à la file", width="stretch",
+                         key=f"dec_rendre_{scan_id}",
+                         help="Libère le lot pour un autre gestionnaire."):
+        repository.liberer_scan(scan_id)
+        st.session_state.pop("scan_ouvert", None)
+        st.session_state.pop("scan_pages_cache", None)
+        st.session_state.pop("decoupage_etat", None)
+        st.rerun()
+
+    with st.expander("🔍 Voir les pages en grand (zoom, rotation)"):
+        ui.visionneuse_images(
+            pages, f"Lot {detail['nom_fichier']}", hauteur=720,
+            etiquettes=[f"Page {i + 1} / {len(pages)} — {fiches[i].libelle()}"
+                        for i in range(len(pages))],
+            avec_impression=False)
 
 
 def _notifier_nouvelle_reception(numero, fournisseur, quai, date_reception,
@@ -2101,9 +2290,10 @@ def dialog_depot_manuel():
     """Filet de sécurité : si la chaîne copieur → mail → Graph est en panne,
     un gestionnaire peut injecter un scan à la main. Le PDF rejoint la même
     file et suivra le même traitement."""
-    st.caption("Le PDF doit contenir **un seul bordereau** (1 à "
-               f"{SETTINGS.scan_max_pages} pages). Il rejoindra la file et "
-               "sera analysé par le prochain passage du job de traitement.")
+    st.caption("Le PDF peut contenir un bordereau ou une pile de plusieurs "
+               f"bordereaux ({SETTINGS.scan_max_pages_lot} pages au plus). Il "
+               "rejoindra la file et sera analysé — et découpé si besoin — par "
+               "le prochain passage du job de traitement.")
     sens_choisi = st.radio("Sens", ["Achat (réception)", "Vente (expédition)"],
                            horizontal=True)
     fichier = st.file_uploader("Fichier PDF", type=["pdf"])
@@ -2118,9 +2308,9 @@ def dialog_depot_manuel():
         except Exception as exc:
             st.error(f"PDF illisible : {exc}")
             return
-        if nb_pages > SETTINGS.scan_max_pages:
+        if nb_pages > SETTINGS.scan_max_pages_lot:
             st.error(f"{nb_pages} pages : au-delà de la limite de "
-                     f"{SETTINGS.scan_max_pages} pour un bordereau.")
+                     f"{SETTINGS.scan_max_pages_lot} pages par scan.")
             return
         sens = (repository.SENS_VENTE if sens_choisi.startswith("Vente")
                 else repository.SENS_ACHAT)
@@ -2140,6 +2330,17 @@ def dialog_depot_manuel():
             st.rerun()
 
 
+def _lot_scan(ligne) -> str:
+    """Colonne « Lot » du journal : lot découpé, ou pages d'origine d'un BL."""
+    if ligne.get("statut") in (repository.STATUT_SCAN_DECOUPE,
+                               repository.STATUT_SCAN_A_DECOUPER):
+        return "lot"
+    parent = ligne.get("id_parent")
+    if parent is not None and not pd.isna(parent):
+        return f"p. {int(ligne.get('page_debut'))}-{int(ligne.get('page_fin'))}"
+    return ""
+
+
 def vue_scans_recus() -> None:
     st.caption("Journal du pipeline : chaque PDF reçu du copieur, son analyse "
                "et son issue. Sert au diagnostic — les scans à traiter sont "
@@ -2149,7 +2350,8 @@ def vue_scans_recus() -> None:
     with barre[0]:
         statuts = st.pills(
             "Statut", options=["RECU", "EN_ANALYSE", "TRAITE_AUTO", "A_VALIDER",
-                               "VALIDE", "REJETE", "ERREUR"],
+                               "VALIDE", "REJETE", "ERREUR", "A_DECOUPER",
+                               "DECOUPE"],
             selection_mode="multi", default=[], key="scans_statuts")
     with barre[1]:
         if not LECTURE_SEULE and st.button("📄 Dépôt manuel", width="stretch"):
@@ -2159,18 +2361,24 @@ def vue_scans_recus() -> None:
     try:
         df = repository.lister_scans(statuts=list(statuts) or None,
                                      date_min=dmin, date_max=dmax)
-        compteurs = repository.stats_scans(
-            (dmin or datetime.date.today() - datetime.timedelta(days=30)))
+        depuis = dmin or datetime.date.today() - datetime.timedelta(days=30)
+        compteurs = repository.stats_scans(depuis)
+        lots = repository.stats_lots(depuis)
         dernier = repository.dernier_scan_recu()
     except Exception as exc:
-        st.error(f"Erreur de lecture : {exc} (migration V001 exécutée ?)")
+        st.error(f"Erreur de lecture : {exc} (migrations V001 et V002 exécutées ?)")
         st.stop()
 
     k = st.columns(5)
-    k[0].metric("Reçus", sum(compteurs.values()))
+    # Un lot découpé n'est pas un bordereau : ses BL sont comptés un par un.
+    a_traiter = (compteurs.get("A_VALIDER", 0) + compteurs.get("A_DECOUPER", 0))
+    k[0].metric("Scans reçus", lots.get("scans", sum(compteurs.values())),
+                help="PDF arrivés du copieur. Un scan peut contenir "
+                     "plusieurs bordereaux.")
     k[1].metric("BL créés automatiquement", compteurs.get("TRAITE_AUTO", 0))
-    k[2].metric("À valider", compteurs.get("A_VALIDER", 0),
-                delta_color="inverse" if compteurs.get("A_VALIDER") else "off")
+    k[2].metric("À valider", a_traiter,
+                delta_color="inverse" if a_traiter else "off",
+                help="Bordereaux à confirmer et lots à découper.")
     k[3].metric("En erreur", compteurs.get("ERREUR", 0),
                 delta_color="inverse" if compteurs.get("ERREUR") else "off")
     # Un pipeline muet est une panne plus dangereuse qu'une erreur bruyante.
@@ -2186,26 +2394,33 @@ def vue_scans_recus() -> None:
     else:
         k[4].metric("Dernier scan", "—")
 
-    total = sum(compteurs.values())
+    total = sum(compteurs.values()) - compteurs.get("DECOUPE", 0)
     if total:
         auto = compteurs.get("TRAITE_AUTO", 0)
         st.caption(f"Taux d'automatisation sur la période : "
                    f"**{100 * auto / total:.0f} %** ({auto} BL créés sans "
-                   f"intervention sur {total} scans).")
+                   f"intervention sur {total} bordereaux reçus).")
+    if lots.get("lots"):
+        st.caption(f"📑 {lots['lots']} scan(s) contenaient plusieurs "
+                   f"bordereaux ; {lots.get('issus', 0)} BL en sont issus.")
 
     if df is None or df.empty:
         st.info("Aucun scan pour ces critères.")
         return
+    df = df.assign(lot=[_lot_scan(ligne) for _, ligne in df.iterrows()])
     st.dataframe(
-        df[["recu_le", "sens", "nom_fichier", "nb_pages", "statut", "confiance",
-            "motif_validation", "expediteur", "traite_le", "traite_par",
-            "tentatives", "erreur"]],
+        df[["recu_le", "sens", "nom_fichier", "lot", "nb_pages", "statut",
+            "confiance", "motif_validation", "expediteur", "traite_le",
+            "traite_par", "tentatives", "erreur"]],
         hide_index=True, width="stretch", height=460,
         column_config={
             "recu_le": st.column_config.DatetimeColumn(
                 "Reçu le", format="DD/MM/YYYY HH:mm"),
             "sens": st.column_config.TextColumn("Sens"),
             "nom_fichier": st.column_config.TextColumn("Fichier", width="medium"),
+            "lot": st.column_config.TextColumn(
+                "Lot", help="Scan de plusieurs bordereaux, ou bordereau issu "
+                            "d'un tel scan (pages concernées)."),
             "nb_pages": st.column_config.NumberColumn("Pages"),
             "statut": st.column_config.TextColumn("Statut"),
             "confiance": st.column_config.TextColumn("Confiance"),

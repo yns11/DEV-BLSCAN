@@ -1,6 +1,7 @@
 """Relève de la boîte de scan : mails du copieur → file d'attente Lakebase.
 
-Le multifonction envoie **un PDF par bordereau** à une adresse dédiée. Ce job
+Le multifonction envoie un PDF par passage — un bordereau, ou une pile de
+plusieurs bordereaux — à une adresse dédiée. Ce job
 relève la boîte via Microsoft Graph, contrôle chaque pièce jointe et la dépose
 dans `scans_recus`. Il ne fait AUCUNE analyse : c'est `traitement_scans.py`
 qui appelle le modèle, ce qui permet de rejouer l'un sans l'autre.
@@ -23,7 +24,8 @@ Sécurité
   interne accepté, à réserver aux essais ;
 * vérification des **octets d'en-tête** du fichier (`%PDF-`), pas de son
   extension ;
-* plafonds de taille et de nombre de pages ;
+* plafonds de taille et de nombre de pages (un scan peut contenir
+  plusieurs bordereaux : le découpage est fait par `traitement_scans.py`) ;
 * le secret du service principal vient d'un **secret scope Databricks**.
 """
 
@@ -69,7 +71,9 @@ PARAMETRES = [
     ("expediteurs_autorises", ""),       # CSV ; vide = pas de filtre
     ("max_messages", "50"),
     ("max_octets_pdf", "41943040"),      # 40 Mo
-    ("max_pages", "25"),
+    # Plafond de pages d'un SCAN. Un scan peut contenir plusieurs bordereaux
+    # passés ensemble au copieur : c'est le traitement qui le découpe.
+    ("max_pages", "60"),
 ]
 
 
@@ -117,7 +121,7 @@ def preparer_environnement(args, workspace: WorkspaceClient) -> None:
         "BL_RBAC_MODE": "strict",
         "BL_SCAN_ALIAS_ACHAT": args.alias_achat,
         "BL_SCAN_ALIAS_VENTE": args.alias_vente,
-        "BL_SCAN_MAX_PAGES": args.max_pages,
+        "BL_SCAN_MAX_PAGES_LOT": args.max_pages,
         # Ce job n'appelle jamais le modèle : l'analyse est faite par
         # traitement_scans.py.
         "BL_LLM_ENDPOINT": "",
@@ -214,9 +218,9 @@ def main() -> None:
             if nb_pages > max_pages:
                 metriques["rejetes"] += 1
                 motifs_rejet.append(
-                    f"{piece.nom} : {nb_pages} pages pour un seul BL "
-                    f"(limite {max_pages}) — le copieur a-t-il scanné "
-                    "plusieurs bordereaux d'un coup ?")
+                    f"{piece.nom} : {nb_pages} pages, au-delà de la limite "
+                    f"de {max_pages} pages par scan (paramètre max_pages). "
+                    "Scanner la pile en deux fois.")
                 continue
 
             scan_id = repository.enregistrer_scan(

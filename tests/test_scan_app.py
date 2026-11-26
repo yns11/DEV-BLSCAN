@@ -78,9 +78,11 @@ def _stub(repository):
     r.telecharger_scan = lambda i: {**SCAN, "contenu": _pdf(3)}
     r.stats_scans = lambda depuis: {"TRAITE_AUTO": 12, "A_VALIDER": 1,
                                     "VALIDE": 4, "ERREUR": 0}
+    r.stats_lots = lambda depuis: {"scans": 17, "lots": 0, "issus": 0}
     r.dernier_scan_recu = lambda: MAINTENANT
     r.verrouiller_scan = lambda i, u, m=60: True
     r.liberer_scan = lambda i: None
+    r.rouvrir_decoupage = lambda i, u: ""
 
 
 def _app(vue, **etat):
@@ -136,7 +138,7 @@ def test_ecran_de_validation_prerempli():
 def test_supervision_du_pipeline():
     at = _app("Scans reçus")
     labels = {m.label: m.value for m in at.metric}
-    assert labels.get("Reçus") == "17", labels          # 12+1+4+0
+    assert labels.get("Scans reçus") == "17", labels
     assert labels.get("BL créés automatiquement") == "12", labels
     captions = " ".join(c.value or "" for c in at.caption)
     assert "Taux d'automatisation" in captions
@@ -156,6 +158,168 @@ def test_alerte_pipeline_muet():
     alertes = " ".join(w.value for w in at.warning)
     assert "Aucun scan reçu depuis" in alertes, alertes
     print("OK : alerte pipeline muet")
+
+
+# ---------------------------------------------------------------------------
+# Lots de plusieurs bordereaux
+# ---------------------------------------------------------------------------
+def _trace_lot():
+    """Proposition du pipeline pour un lot de 6 pages : 2 + 2 (dont une lettre
+    de voiture) + 2, avec un doute sur le dernier groupe."""
+    from bl_core import segmentation as seg
+    bruts = [
+        {"type": "bl", "numero_bl": "8402002398", "page": "1/2", "debut": True},
+        {"type": "bl", "numero_bl": "8402002398", "page": "2/2"},
+        {"type": "bl", "numero_bl": "RB-774512", "page": "1/1", "debut": True},
+        {"type": "lettre_voiture"},
+        {"type": "bl", "numero_bl": "", "page": "", "debut": True},
+        {"type": "bl", "numero_bl": "8402002415", "page": "", "debut": False},
+    ]
+    fiches = [seg.fiche_depuis_modele(i, b) for i, b in enumerate(bruts)]
+    decoupage = seg.decouper(fiches)
+    return decoupage.vers_json(fiches), " ".join(decoupage.incertitudes)
+
+
+def _lot():
+    trace, motif = _trace_lot()
+    return {**SCAN, "id": 9, "nom_fichier": "pile_0931.pdf", "nb_pages": 6,
+            "statut": "A_DECOUPER", "confiance": None, "motif_validation": motif,
+            "extraction": {}, "decoupage": trace, "id_parent": None,
+            "page_debut": None, "page_fin": None}
+
+
+def _app_lot(creations=None, **etat):
+    from bl_core import repository
+    _stub(repository)
+    lot = _lot()
+    repository.lister_scans = lambda **k: pd.DataFrame([
+        {**SCAN, "id_parent": None, "page_debut": None, "page_fin": None}, lot])
+    repository.telecharger_scan = lambda i: {**lot, "contenu": _pdf(6)}
+    repository.creer_segments = (
+        lambda parent, charges, utilisateur, trace=None:
+        (creations if creations is not None else []).append(
+            (parent, charges, utilisateur, trace)) or [101, 102, 103])
+    at = AppTest.from_file(str(ROOT / "src/app_administration/app.py"),
+                           default_timeout=30)
+    at.session_state["nav_vue"] = "Scans à valider (achat)"
+    for cle, valeur in etat.items():
+        at.session_state[cle] = valeur
+    at.run()
+    assert not at.exception, at.exception
+    return at
+
+
+def _bouton(at, fragment):
+    return next(b for b in at.button if fragment in (b.label or ""))
+
+
+def test_un_lot_a_decouper_figure_dans_la_file():
+    at = _app_lot()
+    labels = {m.label: m.value for m in at.metric}
+    assert labels.get("Scans à valider") == "2", labels
+    grille = at.dataframe[0].value
+    assert list(grille["nature"]) == ["📄 BL à valider", "✂️ Lot à découper"]
+
+
+def test_ecran_de_decoupage_part_de_la_proposition_du_pipeline():
+    """Aucun appel au modèle : fiches et coupes viennent de la colonne
+    `decoupage`. Le motif du doute est affiché."""
+    at = _app_lot(scan_ouvert=9)
+    debuts = [c for c in at.checkbox if "Nouveau BL ici" in c.label]
+    assert len(debuts) == 6
+    assert [c.value for c in debuts] == [True, False, True, False, True, False]
+    assert debuts[0].disabled                    # la première page ouvre toujours un BL
+    assert "(3 BL)" in _bouton(at, "Confirmer le découpage").label
+    assert "sans numéro de BL" in " ".join(w.value for w in at.warning)
+    recap = at.dataframe[0].value
+    assert list(recap["Numéro lu"]) == ["8402002398", "RB-774512", "8402002415"]
+    assert list(recap["Annexes"]) == [0, 1, 0]   # la lettre de voiture suit le 2e BL
+    legendes = " ".join(c.value or "" for c in at.caption)
+    assert "Lettre de voiture" in legendes
+
+
+def test_reunir_deux_bl_declenche_une_alerte_et_exige_une_confirmation():
+    at = _app_lot(scan_ouvert=9)
+    coupe = [c for c in at.checkbox if "Nouveau BL ici" in c.label][2]
+    coupe.uncheck().run()                        # réunit les BL 1 et 2
+    assert not at.exception, at.exception
+    bouton = _bouton(at, "Confirmer le découpage")
+    assert "(2 BL)" in bouton.label
+    assert "numéros de BL différents" in " ".join(w.value for w in at.warning)
+    assert bouton.disabled                       # tant que l'alerte n'est pas assumée
+    next(c for c in at.checkbox if "malgré les alertes" in c.label).check().run()
+    assert not _bouton(at, "Confirmer le découpage").disabled
+
+
+def test_revenir_a_la_proposition():
+    at = _app_lot(scan_ouvert=9)
+    [c for c in at.checkbox if "Nouveau BL ici" in c.label][2].uncheck().run()
+    _bouton(at, "Revenir à la proposition").click().run()
+    assert not at.exception, at.exception
+    assert "(3 BL)" in _bouton(at, "Confirmer le découpage").label
+
+
+def test_confirmer_cree_un_scan_par_bordereau():
+    """Chaque groupe devient un PDF autonome ; la page écartée n'y entre pas."""
+    import pymupdf
+    creations = []
+    at = _app_lot(creations, scan_ouvert=9)
+    # Le gestionnaire écarte la page 5 (début de document illisible).
+    [c for c in at.checkbox if "Écarter la page" in c.label][4].check().run()
+    assert "(3 BL)" in _bouton(at, "Confirmer le découpage").label
+    _bouton(at, "Confirmer le découpage").click().run()
+    assert not at.exception, at.exception
+    (parent, charges, auteur, trace), = creations
+    assert parent == 9 and auteur == "appro@emotors.com"
+    assert [(c["page_debut"], c["page_fin"]) for c in charges] == [(1, 2), (3, 4), (6, 6)]
+    tailles = [pymupdf.open(stream=c["contenu"], filetype="pdf").page_count
+               for c in charges]
+    assert tailles == [2, 2, 1]
+    assert charges[1]["decoupage"]["annexes"] == [1]
+    assert trace["ecartees"] == [4] and trace["confirme_par"] == auteur
+
+
+def test_bordereau_issu_dun_lot_peut_rouvrir_le_decoupage():
+    from bl_core import repository
+    _stub(repository)
+    fils = {**SCAN, "id": 101, "id_parent": 9, "page_debut": 3, "page_fin": 4,
+            "nom_fichier": "pile_0931 [p. 3-4].pdf",
+            "decoupage": {"rang": 2, "total": 3, "annexes": [1],
+                          "avertissements": []}}
+    repository.lister_scans = lambda **k: pd.DataFrame([fils])
+    repository.telecharger_scan = lambda i: {**fils, "contenu": _pdf(2)}
+    rouverts = []
+    repository.rouvrir_decoupage = lambda i, u: rouverts.append((i, u)) or ""
+    at = AppTest.from_file(str(ROOT / "src/app_administration/app.py"),
+                           default_timeout=30)
+    at.session_state["nav_vue"] = "Scans à valider (achat)"
+    at.session_state["scan_ouvert"] = 101
+    at.run()
+    assert not at.exception, at.exception
+    assert "Bordereau 2 sur 3" in " ".join(c.value or "" for c in at.caption)
+    _bouton(at, "Revoir le découpage du lot").click().run()
+    assert rouverts == [(9, "appro@emotors.com")]
+    assert at.session_state["scan_ouvert"] == 9         # on bascule sur le lot
+
+
+def test_supervision_distingue_scans_et_bordereaux():
+    """Un lot découpé n'est pas un bordereau : le taux d'automatisation se
+    compte par BL, pas par PDF reçu."""
+    from bl_core import repository
+    _stub(repository)
+    repository.stats_scans = lambda depuis: {"TRAITE_AUTO": 6, "A_VALIDER": 1,
+                                             "A_DECOUPER": 1, "DECOUPE": 2}
+    repository.stats_lots = lambda depuis: {"scans": 5, "lots": 3, "issus": 5}
+    at = AppTest.from_file(str(ROOT / "src/app_administration/app.py"),
+                           default_timeout=30)
+    at.session_state["nav_vue"] = "Scans reçus"
+    at.run()
+    assert not at.exception, at.exception
+    labels = {m.label: m.value for m in at.metric}
+    assert labels.get("Scans reçus") == "5" and labels.get("À valider") == "2"
+    captions = " ".join(c.value or "" for c in at.caption)
+    assert "75 %" in captions            # 6 sur 8 bordereaux (lots découpés exclus)
+    assert "3 scan(s) contenaient plusieurs bordereaux" in captions
 
 
 if __name__ == "__main__":
