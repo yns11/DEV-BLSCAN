@@ -96,3 +96,35 @@ def test_le_controle_signale_un_module_absent(common):
             common.verifier_bl_core("module_fantome")
     finally:
         del common.SYMBOLES_REQUIS["module_fantome"]
+
+
+def test_les_jobs_trouvent_bl_core_dans_le_depot_sans_copie():
+    """Un job lancé depuis le dépôt (dossier Git de l'espace de travail) doit
+    trouver `shared/bl_core` tout seul : plus de copie à poser à côté des
+    scripts, donc plus de mélange de versions après une mise à jour.
+
+    Vérifié dans un sous-processus qui ne connaît QUE le dossier des scripts,
+    comme une tâche « Python script » réelle."""
+    import subprocess
+
+    code = (
+        "import sys, types\n"
+        "for nom in ('databricks', 'databricks.sdk'):\n"
+        "    sys.modules[nom] = types.ModuleType(nom)\n"
+        "sys.modules['databricks.sdk'].WorkspaceClient = object\n"
+        f"sys.path.insert(0, {str(ROOT / 'jobs')!r})\n"
+        "import common, bl_core\n"
+        "print(bl_core.__file__)\n")
+    resultat = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                              text=True, cwd="/", timeout=60,
+                              env={"PATH": "/usr/bin:/bin", "BL_ENVIRONMENT": "local"})
+    assert resultat.returncode == 0, resultat.stderr
+    assert str(ROOT / "shared" / "bl_core") in resultat.stdout
+
+
+def test_app_yaml_ne_contient_aucune_url_de_webhook():
+    """Le dépôt est public : l'URL signée d'un flux Teams suffit à publier
+    dans le canal. Elle passe par une ressource de l'app, jamais en clair."""
+    texte = (ROOT / "src/app_administration/app.yaml").read_text()
+    assert "powerplatform" not in texte and "sig=" not in texte
+    assert "valueFrom: teams-webhook-edi" in texte

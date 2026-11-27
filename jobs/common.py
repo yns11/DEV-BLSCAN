@@ -6,12 +6,35 @@ import json
 import logging
 import sys
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Iterator
 
 import psycopg
 from databricks.sdk import WorkspaceClient
 
 logger = logging.getLogger("bl.jobs.common")
+
+
+def _rendre_bl_core_importable() -> None:
+    """Permet aux jobs de tourner DIRECTEMENT depuis le dépôt.
+
+    Les scripts sont dans `jobs/`, le cœur métier dans `shared/bl_core/`. Tant
+    qu'il fallait recopier `bl_core` à côté des scripts, chaque mise à jour
+    risquait de laisser un mélange de versions. Ici, si aucune copie n'est
+    posée à côté des scripts, on ajoute `../shared` au chemin de recherche :
+    un `git pull` du dossier suffit alors à mettre à jour les jobs.
+
+    Une copie adjacente, si elle existe, garde la priorité (déploiement
+    « dossier à plat » d'origine) — mais elle n'est plus nécessaire."""
+    ici = Path(__file__).resolve().parent
+    if (ici / "bl_core").is_dir():
+        return
+    partage = ici.parent / "shared"
+    if (partage / "bl_core").is_dir() and str(partage) not in sys.path:
+        sys.path.append(str(partage))
+
+
+_rendre_bl_core_importable()
 
 
 def configure_logging() -> None:
@@ -181,6 +204,13 @@ def verifier_bl_core(*modules: str) -> None:
     traitement sur `Referentiel`."""
     import importlib
 
+    try:
+        import bl_core
+        logger.info("bl_core chargé depuis %s (version %s)",
+                    Path(bl_core.__file__).parent,
+                    getattr(bl_core, "__version__", "?"))
+    except Exception:
+        pass                       # l'absence est signalée module par module
     manquants = []
     for nom in modules:
         attendus = SYMBOLES_REQUIS.get(nom)

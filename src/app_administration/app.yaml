@@ -1,14 +1,18 @@
 # =============================================================================
 # App « Administration des BL » — variante SCAN COPIEUR.
-# Toute la configuration est ici (ni bundle, ni secret scope).
+# Toute la configuration est ici. Ce fichier est IDENTIQUE dans le dépôt et
+# dans l'espace de travail : ne pas le modifier sur place, sinon le prochain
+# « git pull » entre en conflit. Une valeur sensible passe par une ressource
+# de l'app (valueFrom), jamais en clair.
 #
 # NON déclaré ici, car injecté automatiquement par Databricks Apps :
 #   * PGHOST / PGPORT / PGDATABASE / PGUSER / PGSSLMODE -> ressource Database
 #     (Lakebase), à ajouter dans Edit ▸ Resources avec la clé « postgres » ;
 #   * l'identité SSO de l'utilisateur (en-têtes HTTP).
 #
-# Le SEUL secret de la solution (client secret Entra ID) n'est PAS ici : il
-# vit dans un secret scope Databricks et n'est lu que par les jobs.
+# Les deux secrets de la solution vivent dans le secret scope Databricks
+# « bldemat_scan », jamais ici : le client secret Entra ID (lu par les jobs) et
+# l'URL du flux Teams EDI (lue par l'app, via la ressource ci-dessous).
 # =============================================================================
 command: ["streamlit", "run", "app.py", "--server.headless=true"]
 env:
@@ -81,11 +85,17 @@ env:
 
   # --- Notification Teams -----------------------------------------------------
   # Nouvelle réception (créée automatiquement ou après validation).
+  # VIDE EXPRÈS : les notifications de réception sont désactivées.
   - name: BL_TEAMS_WEBHOOK_RECEPTION
     value: ""
   # Passage EDI NOK -> OK depuis la fiche BL.
+  # L'URL du flux contient une signature qui suffit à publier dans le canal :
+  # elle ne doit PAS figurer dans ce fichier (dépôt public). Elle vient d'un
+  # secret Databricks, rattaché à l'app comme ressource « Secret » de clé
+  # « teams-webhook-edi » (Edit ▸ Resources). Voir GUIDE.md, « Déployer une
+  # nouvelle version ».
   - name: BL_TEAMS_WEBHOOK_EDI
-    value: ""
+    valueFrom: teams-webhook-edi
   - name: BL_TEAMS_TIMEOUT_S
     value: "8"
   # flow  (défaut) l'app envoie les e-mails + le marqueur {{MENTIONS}} ; le flux

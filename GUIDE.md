@@ -242,21 +242,18 @@ saisi à la main, qui doit posséder un rôle Postgres et des droits.
 > automatiquement l'identité *Run as* (le job appelle `current_user.me()`), ce
 > qui garantit que le nom d'utilisateur et le jeton désignent la même personne.
 
-## Étape 7 — Déposer le code des jobs
+## Étape 7 — Le code des jobs
 
-Dans l'espace de travail, un dossier par exemple `/Workspace/Shared/bldemat-scan/`
-contenant :
+**Recommandé : faire pointer les jobs sur le dossier Git du dépôt.** Dans
+chaque tâche, le chemin du script est celui du dépôt cloné dans l'espace de
+travail, par exemple `…/DEV-BLSCAN/jobs/traitement_scans.py`. Rien à copier :
+`common.py` ajoute de lui-même `../shared` au chemin de recherche, et les jobs
+trouvent `shared/bl_core` tels qu'ils sont dans le dépôt. Un « git pull » du
+dossier met alors à jour l'application **et** les jobs.
 
-```
-common.py                 ← obligatoire, à côté des scripts
-ingestion_scans.py
-traitement_scans.py
-sync_referentiels_erp.py
-rapports_activite.py
-maintenance.py
-simulation_donnees.py
-bl_core/                  ← copie de shared/bl_core (tous les jobs sauf sync)
-```
+Variante d'origine, toujours acceptée : un dossier à plat contenant les scripts
+et une copie de `bl_core/` à côté d'eux. Elle oblige à recopier `bl_core` à
+chaque mise à jour, d'où l'avertissement ci-dessous.
 
 `cache.py` bascule automatiquement sur `functools.lru_cache` hors application.
 Aucune logique métier n'est dupliquée entre l'app et les jobs — c'est **le
@@ -541,6 +538,51 @@ Dans cet ordre — chaque étape se vérifie avant de passer à la suivante :
 
 Ensuite seulement : activer les planifications, et faire scanner un vrai BL
 depuis le copieur.
+
+## Déployer une nouvelle version
+
+Trois commandes, une fois la mise en place ci-dessous faite :
+
+```bash
+SRC=/Workspace/Users/<vous>/<dossier>/DEV-BLSCAN
+
+databricks repos update "$SRC" --branch main                      # « git pull »
+databricks apps deploy bl-administration-scan \
+    --source-code-path "$SRC/src/app_administration"               # application
+databricks jobs run-now <ID_DU_JOB_traitement_scans>               # essai
+```
+
+Les jobs n'ont pas à être redéployés : ils lisent le dépôt à chaque exécution.
+Si une version apporte une migration SQL (`sql/migrations/V00x`), l'exécuter
+dans l'éditeur SQL Lakebase **avant** ces commandes ; les notes de version le
+signalent.
+
+**Mise en place, une seule fois.** Elle garantit qu'aucun fichier du dépôt
+n'est modifié sur place, donc qu'aucun « git pull » n'entre en conflit.
+
+1. **L'URL du flux Teams EDI sort d'`app.yaml`.** Elle contient une signature
+   qui suffit à publier dans le canal, et le dépôt est public. La placer dans
+   le secret scope :
+
+   ```bash
+   databricks secrets put-secret bldemat_scan teams_webhook_edi \
+       --string-value 'URL_COMPLÈTE_DU_FLUX'
+   ```
+
+   puis la rattacher à l'app : page de l'app ▸ **Edit ▸ Resources ▸ + Add
+   resource ▸ Secret** — scope `bldemat_scan`, clé `teams_webhook_edi`,
+   permission **Can read**, **clé de ressource `teams-webhook-edi`**.
+   `app.yaml` y fait référence par `valueFrom: teams-webhook-edi`. Sans cette
+   ressource, le déploiement est refusé avec un message qui la nomme, et la
+   version en service continue de tourner.
+2. **Annuler la modification locale d'`app.yaml`** dans le dossier Git
+   (fenêtre Git du dossier ▸ `app.yaml` ▸ *Discard changes*). Le fichier du
+   dépôt porte déjà la configuration de l'environnement.
+3. **Faire pointer les jobs sur le dépôt** (étape 7) : dans chaque tâche,
+   chemin du script = `$SRC/jobs/<script>.py`.
+
+Pour ne rien notifier dans Teams, laisser `BL_TEAMS_WEBHOOK_RECEPTION` vide
+(c'est le cas) et le paramètre `teams_webhook_reception` du job vide.
 
 ---
 
